@@ -494,3 +494,144 @@ func TestHandler_SourceFilter_SuffixMatch(t *testing.T) {
 		t.Error("Expected debug message with suffix matching source file to be emitted")
 	}
 }
+
+func TestHandler_OutputLevel_ElevateDebugToInfo(t *testing.T) {
+	var buf bytes.Buffer
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelInfo)
+
+	inner := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	handler := NewHandler(inner, level)
+
+	// Filter that allows debug logs but elevates them to INFO in output
+	handler.SetFilters([]LogFilter{
+		{Type: "job_id", Pattern: "debug_*", Level: "debug", OutputLevel: "info", Enabled: true},
+	})
+
+	logger := slog.New(handler)
+
+	// Debug with matching job_id should be emitted AS INFO
+	buf.Reset()
+	logger.Debug("test message", "job_id", "debug_123")
+	if buf.Len() == 0 {
+		t.Error("Expected debug message with matching filter to be emitted")
+	}
+	output := buf.String()
+	if !strings.Contains(output, "level=INFO") {
+		t.Errorf("Expected output level to be INFO, got: %s", output)
+	}
+	if strings.Contains(output, "level=DEBUG") {
+		t.Errorf("Expected DEBUG to be transformed to INFO, got: %s", output)
+	}
+}
+
+func TestHandler_OutputLevel_ElevateDebugToWarn(t *testing.T) {
+	var buf bytes.Buffer
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelInfo)
+
+	inner := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	handler := NewHandler(inner, level)
+
+	// Filter that allows debug logs but elevates them to WARN in output
+	handler.SetFilters([]LogFilter{
+		{Type: "job_id", Pattern: "critical_*", Level: "debug", OutputLevel: "warn", Enabled: true},
+	})
+
+	logger := slog.New(handler)
+
+	// Debug with matching job_id should be emitted AS WARN
+	buf.Reset()
+	logger.Debug("important debug info", "job_id", "critical_job_123")
+	if buf.Len() == 0 {
+		t.Error("Expected debug message to be emitted")
+	}
+	output := buf.String()
+	if !strings.Contains(output, "level=WARN") {
+		t.Errorf("Expected output level to be WARN, got: %s", output)
+	}
+}
+
+func TestHandler_OutputLevel_NoTransformWithoutOutputLevel(t *testing.T) {
+	var buf bytes.Buffer
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelInfo)
+
+	inner := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	handler := NewHandler(inner, level)
+
+	// Filter without OutputLevel - should preserve original level
+	handler.SetFilters([]LogFilter{
+		{Type: "job_id", Pattern: "debug_*", Level: "debug", Enabled: true},
+	})
+
+	logger := slog.New(handler)
+
+	// Debug should be emitted as DEBUG (no transformation)
+	buf.Reset()
+	logger.Debug("test message", "job_id", "debug_123")
+	if buf.Len() == 0 {
+		t.Error("Expected debug message to be emitted")
+	}
+	output := buf.String()
+	if !strings.Contains(output, "level=DEBUG") {
+		t.Errorf("Expected output level to be DEBUG (preserved), got: %s", output)
+	}
+}
+
+func TestHandler_OutputLevel_InfoToError(t *testing.T) {
+	var buf bytes.Buffer
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelInfo)
+
+	inner := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	handler := NewHandler(inner, level)
+
+	// Filter that elevates INFO to ERROR for certain jobs
+	handler.SetFilters([]LogFilter{
+		{Type: "job_id", Pattern: "important_*", Level: "info", OutputLevel: "error", Enabled: true},
+	})
+
+	logger := slog.New(handler)
+
+	// Info with matching job_id should be emitted AS ERROR
+	buf.Reset()
+	logger.Info("status update", "job_id", "important_job_456")
+	if buf.Len() == 0 {
+		t.Error("Expected info message to be emitted")
+	}
+	output := buf.String()
+	if !strings.Contains(output, "level=ERROR") {
+		t.Errorf("Expected output level to be ERROR, got: %s", output)
+	}
+}
+
+func TestHandler_OutputLevel_PreservesAttributes(t *testing.T) {
+	var buf bytes.Buffer
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelInfo)
+
+	inner := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	handler := NewHandler(inner, level)
+
+	handler.SetFilters([]LogFilter{
+		{Type: "job_id", Pattern: "debug_*", Level: "debug", OutputLevel: "info", Enabled: true},
+	})
+
+	logger := slog.New(handler)
+
+	// Attributes should be preserved when level is transformed
+	buf.Reset()
+	logger.Debug("test", "job_id", "debug_123", "extra_attr", "some_value", "count", 42)
+	output := buf.String()
+
+	if !strings.Contains(output, "job_id=debug_123") {
+		t.Errorf("Expected job_id attribute to be preserved, got: %s", output)
+	}
+	if !strings.Contains(output, "extra_attr=some_value") {
+		t.Errorf("Expected extra_attr to be preserved, got: %s", output)
+	}
+	if !strings.Contains(output, "count=42") {
+		t.Errorf("Expected count attribute to be preserved, got: %s", output)
+	}
+}

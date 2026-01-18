@@ -1,6 +1,7 @@
 package logfilter
 
 import (
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -29,9 +30,17 @@ type LogFilter struct {
 	//   - "*contains*" contains match
 	Pattern string `json:"pattern"`
 
-	// Level to apply when this filter matches.
+	// Level is the minimum threshold for logs matching this filter.
+	// Logs below this level are suppressed, logs at or above pass through.
 	// Valid values: "debug", "info", "warn", "error"
 	Level string `json:"level"`
+
+	// OutputLevel optionally transforms the log level in the output.
+	// If set, matching logs are emitted at this level instead of their original level.
+	// This is useful for elevating debug logs to info so they appear in normal log streams.
+	// If empty, the original log level is preserved.
+	// Valid values: "", "debug", "info", "warn", "error"
+	OutputLevel string `json:"output_level,omitempty"`
 
 	// Enabled controls whether this filter is active.
 	Enabled bool `json:"enabled"`
@@ -96,6 +105,35 @@ func (f *LogFilter) AttributeKey() string {
 		return ""
 	}
 	return f.Type
+}
+
+// HasOutputLevel returns true if this filter transforms the output level.
+func (f *LogFilter) HasOutputLevel() bool {
+	return f.OutputLevel != ""
+}
+
+// GetOutputLevel returns the parsed output level, or the original level if not set.
+func (f *LogFilter) GetOutputLevel(originalLevel slog.Level) slog.Level {
+	if f.OutputLevel == "" {
+		return originalLevel
+	}
+	return ParseLevel(f.OutputLevel)
+}
+
+// ParseLevel converts a level string to slog.Level.
+func ParseLevel(level string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // matchPattern performs fast glob-style pattern matching.

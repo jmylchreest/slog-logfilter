@@ -54,13 +54,29 @@ func main() {
 
 ```go
 type LogFilter struct {
-    Type      string     `json:"type"`       // Attribute key or special prefix
-    Pattern   string     `json:"pattern"`    // Glob pattern for value
-    Level     string     `json:"level"`      // Level: debug, info, warn, error
-    Enabled   bool       `json:"enabled"`    // Whether filter is active
-    ExpiresAt *time.Time `json:"expires_at"` // Optional expiry (nil = never)
+    Type        string     `json:"type"`         // Attribute key or special prefix
+    Pattern     string     `json:"pattern"`      // Glob pattern for value
+    Level       string     `json:"level"`        // Minimum threshold: debug, info, warn, error
+    OutputLevel string     `json:"output_level"` // Optional: transform output level
+    Enabled     bool       `json:"enabled"`      // Whether filter is active
+    ExpiresAt   *time.Time `json:"expires_at"`   // Optional expiry (nil = never)
 }
 ```
+
+### Field Defaults and Behavior
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `type` | (required) | Attribute key, or special prefix (`context:`, `source:file`, `source:function`) |
+| `pattern` | (required) | Glob pattern: `exact`, `prefix*`, `*suffix`, `*contains*` |
+| `level` | `"info"` | Minimum threshold. Logs below this level are suppressed. |
+| `output_level` | (pass-through) | If omitted/empty, preserves original log level. If set, transforms output. |
+| `enabled` | `false` | Filter is only active when `true` |
+| `expires_at` | (never) | If omitted/null, filter never expires |
+
+**Important:**
+- `level=""` defaults to `"info"`, which suppresses DEBUG logs. Use `level="debug"` to allow all levels.
+- `output_level=""` or omitted means **pass-through** - the original log level is preserved in output.
 
 ### Filter Types
 
@@ -146,8 +162,21 @@ logfilter.AddFilter(logfilter.LogFilter{
 
 ### Source Filter Details
 
-- **`source:file`** - Matches against the relative file path (e.g., `internal/service/extraction.go`)
+- **`source:file`** - Matches against the source file path
 - **`source:function`** - Matches against the function name (e.g., `(*ExtractionService).Extract`)
+
+**Path formats for `source:file`:**
+- **Local files** (within your project): relative path like `internal/service/extraction.go`
+- **External packages**: prefixed with `@` like `@github.com/user/repo/pkg/file.go`
+
+This allows you to filter logs from specific external dependencies:
+
+```json
+[
+  {"type": "source:file", "pattern": "internal/*", "level": "debug", "enabled": true},
+  {"type": "source:file", "pattern": "@github.com/jmylchreest/refyne/*", "level": "debug", "enabled": true}
+]
+```
 
 ### Performance
 
@@ -219,6 +248,31 @@ filters := []logfilter.LogFilter{
     {Type: "job_id", Pattern: "job_123", Level: "error", Enabled: true}, // Never used for job_123
 }
 // "job_123" matches first filter, uses DEBUG (not ERROR)
+```
+
+### Output Level Transformation
+
+Use `output_level` to transform the emitted log level. This is useful when you want verbose debugging but don't want DEBUG-level noise in your log aggregator:
+
+```go
+// Global level: INFO
+// Filter: {type: "job_id", pattern: "debug_*", level: "debug", output_level: "info"}
+
+logger.Debug("detailed trace", "job_id", "debug_123")
+// Result: Emitted as INFO (passes filter, level transformed)
+// Output: level=INFO msg="detailed trace" job_id=debug_123
+```
+
+**Use cases:**
+- Elevate debug logs to INFO so they appear in production log streams
+- Make important debug info visible without lowering global log level
+- Tag certain debug logs as WARN for alerting systems
+
+```json
+[
+  {"type": "job_id", "pattern": "critical_*", "level": "debug", "output_level": "warn", "enabled": true},
+  {"type": "source:file", "pattern": "internal/payment/*", "level": "debug", "output_level": "info", "enabled": true}
+]
 ```
 
 ## Integration Example

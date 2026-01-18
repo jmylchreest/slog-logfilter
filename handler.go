@@ -104,7 +104,7 @@ func (h *Handler) updateLowestLevel() {
 		if !f.IsActive() {
 			continue
 		}
-		level := parseLevel(f.Level)
+		level := ParseLevel(f.Level)
 		if level < h.lowestLevel {
 			h.lowestLevel = level
 		}
@@ -133,8 +133,10 @@ func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 // Handle processes a log record, applying filters to determine the effective level.
+// If a matching filter has OutputLevel set, the record's level is transformed before emission.
 func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 	effectiveLevel := h.globalLevel.Level()
+	var matchedFilter *LogFilter
 
 	// Collect attributes from record and preformatted attrs
 	attrs := make(map[string]string)
@@ -162,7 +164,8 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 		sourceFile, sourceFunction = h.extractSource(r.PC)
 	}
 
-	for _, f := range filters {
+	for i := range filters {
+		f := &filters[i]
 		if !f.IsActive() {
 			continue
 		}
@@ -188,7 +191,8 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 		}
 
 		if found && f.Matches(value) {
-			effectiveLevel = parseLevel(f.Level)
+			effectiveLevel = ParseLevel(f.Level)
+			matchedFilter = f
 			break // First match wins
 		}
 	}
@@ -198,26 +202,29 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 		return nil // Suppress
 	}
 
+	// Transform log level if filter specifies an output level
+	if matchedFilter != nil && matchedFilter.HasOutputLevel() {
+		// Create a new record with the transformed level
+		newRecord := slog.NewRecord(r.Time, matchedFilter.GetOutputLevel(r.Level), r.Message, r.PC)
+		r.Attrs(func(a slog.Attr) bool {
+			newRecord.AddAttrs(a)
+			return true
+		})
+		return h.inner.Handle(ctx, newRecord)
+	}
+
 	return h.inner.Handle(ctx, r)
 }
 
 // extractSource extracts the source file and function name from a program counter.
-// The file path is made relative to the working directory when possible.
+// For local files (within working directory), returns relative paths.
+// For external packages, returns the module path (e.g., "@github.com/pkg/module/file.go").
 func (h *Handler) extractSource(pc uintptr) (file, function string) {
 	frames := runtime.CallersFrames([]uintptr{pc})
 	frame, _ := frames.Next()
 
 	if frame.File != "" {
-		// Try to make the path relative to working directory
-		if h.workDir != "" {
-			if rel, err := filepath.Rel(h.workDir, frame.File); err == nil {
-				file = rel
-			} else {
-				file = filepath.Base(frame.File)
-			}
-		} else {
-			file = frame.File
-		}
+		file = h.formatSourcePath(frame.File, frame.Function)
 	}
 
 	if frame.Function != "" {
@@ -236,6 +243,41 @@ func (h *Handler) extractSource(pc uintptr) (file, function string) {
 	}
 
 	return file, function
+}
+
+// formatSourcePath formats the source file path for display.
+// Local files (within working directory) get relative paths.
+// External packages get module paths prefixed with "@".
+func (h *Handler) formatSourcePath(filePath, functionName string) string {
+	// Try to make the path relative to working directory
+	if h.workDir != "" {
+		if rel, err := filepath.Rel(h.workDir, filePath); err == nil {
+			// Check if it's within the project (doesn't start with ..)
+			if !strings.HasPrefix(rel, "..") {
+				return rel
+			}
+		}
+	}
+
+	// External package - extract module path from function name
+	// Function name looks like: "github.com/user/repo/pkg.(*Type).Method"
+	if functionName != "" {
+		// Find the last slash to get the package path
+		if lastSlash := strings.LastIndex(functionName, "/"); lastSlash >= 0 {
+			// Get everything up to and including the package name
+			afterSlash := functionName[lastSlash+1:]
+			if dotIdx := strings.Index(afterSlash, "."); dotIdx >= 0 {
+				// Module path is everything before the type/function
+				modulePath := functionName[:lastSlash+1+dotIdx]
+				// Add the filename
+				fileName := filepath.Base(filePath)
+				return "@" + modulePath + "/" + fileName
+			}
+		}
+	}
+
+	// Fallback to just the filename
+	return filepath.Base(filePath)
 }
 
 // WithAttrs returns a new Handler with the given attributes added.
@@ -262,22 +304,6 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 		hasSourceFilters:  h.hasSourceFilters,
 		preformattedAttrs: h.preformattedAttrs,
 		workDir:           h.workDir,
-	}
-}
-
-// parseLevel converts a level string to slog.Level.
-func parseLevel(level string) slog.Level {
-	switch strings.ToLower(strings.TrimSpace(level)) {
-	case "debug":
-		return slog.LevelDebug
-	case "info":
-		return slog.LevelInfo
-	case "warn", "warning":
-		return slog.LevelWarn
-	case "error":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
 	}
 }
 
