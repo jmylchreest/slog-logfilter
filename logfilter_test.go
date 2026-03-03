@@ -237,3 +237,109 @@ func TestIntegration_FilterExpiry(t *testing.T) {
 		t.Error("Expected active filter to match")
 	}
 }
+
+func TestTrimSourcePath(t *testing.T) {
+	tests := []struct {
+		name     string
+		filePath string
+		prefix   string
+		workDir  string
+		want     string
+	}{
+		{
+			name:     "module prefix strips absolute build path",
+			filePath: "/home/user/src/github.com/user/repo/pkg/foo/bar.go",
+			prefix:   "/home/user/src/github.com/user/repo/",
+			workDir:  "/",
+			want:     "pkg/foo/bar.go",
+		},
+		{
+			name:     "module prefix found mid-path",
+			filePath: "/opt/build/github.com/user/repo/internal/server.go",
+			prefix:   "github.com/user/repo",
+			workDir:  "/run/svc",
+			want:     "internal/server.go",
+		},
+		{
+			name:     "workDir-relative path when prefix empty",
+			filePath: "/home/user/project/pkg/foo.go",
+			prefix:   "",
+			workDir:  "/home/user/project",
+			want:     "pkg/foo.go",
+		},
+		{
+			name:     "workDir produces .. prefix, falls to basename",
+			filePath: "/home/user/src/repo/pkg/foo.go",
+			prefix:   "",
+			workDir:  "/var/run",
+			want:     "foo.go",
+		},
+		{
+			name:     "empty prefix and workDir, falls to basename",
+			filePath: "/some/absolute/path/file.go",
+			prefix:   "",
+			workDir:  "",
+			want:     "file.go",
+		},
+		{
+			name:     "prefix not found in path, workDir relative works",
+			filePath: "/home/user/project/cmd/main.go",
+			prefix:   "github.com/other/repo",
+			workDir:  "/home/user/project",
+			want:     "cmd/main.go",
+		},
+		{
+			name:     "already trimmed path (no separators to strip)",
+			filePath: "pkg/foo/bar.go",
+			prefix:   "",
+			workDir:  "",
+			want:     "bar.go",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := trimSourcePath(tt.filePath, tt.prefix, tt.workDir)
+			if got != tt.want {
+				t.Errorf("trimSourcePath(%q, %q, %q) = %q, want %q",
+					tt.filePath, tt.prefix, tt.workDir, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSourcePathInLogOutput(t *testing.T) {
+	var buf bytes.Buffer
+	logger := New(
+		WithLevel(slog.LevelInfo),
+		WithFormat("text"),
+		WithOutput(&buf),
+		WithSource(true),
+	)
+
+	logger.Info("test source path")
+	output := buf.String()
+
+	// The source path should be relative to the module root,
+	// not an absolute filesystem path.
+	if strings.Contains(output, "/home/") {
+		t.Errorf("Log output contains absolute path: %s", output)
+	}
+	// Should contain just the package-relative path
+	if !strings.Contains(output, "logfilter_test.go") {
+		t.Errorf("Log output missing expected filename: %s", output)
+	}
+}
+
+func TestDetectSourcePrefix(t *testing.T) {
+	prefix := detectSourcePrefix()
+	// When running tests, the prefix should be non-empty since
+	// we have valid build info from the test binary.
+	if prefix == "" {
+		t.Skip("No build info available (expected in some CI environments)")
+	}
+	// The prefix should contain the module path
+	if !strings.Contains(prefix, "slog-logfilter") {
+		t.Errorf("Expected prefix to contain module name, got %q", prefix)
+	}
+}

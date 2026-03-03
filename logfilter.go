@@ -45,6 +45,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"sync"
 )
 
@@ -122,17 +124,15 @@ func New(opts ...Option) *slog.Logger {
 
 	defaultLevel.Set(o.level)
 
+	trimPrefix := detectSourcePrefix()
+
 	handlerOpts := &slog.HandlerOptions{
 		Level:     defaultLevel,
 		AddSource: o.source,
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			if a.Key == slog.SourceKey && o.workDir != "" {
+			if a.Key == slog.SourceKey {
 				if src, ok := a.Value.Any().(*slog.Source); ok {
-					if rel, err := filepath.Rel(o.workDir, src.File); err == nil {
-						src.File = rel
-					} else {
-						src.File = filepath.Base(src.File)
-					}
+					src.File = trimSourcePath(src.File, trimPrefix, o.workDir)
 				}
 			}
 			return a
@@ -241,4 +241,74 @@ func SetDefault(opts ...Option) *slog.Logger {
 	logger := New(opts...)
 	slog.SetDefault(logger)
 	return logger
+}
+
+// detectSourcePrefix discovers the filesystem prefix that should be stripped
+// from source paths to produce clean, module-relative paths.
+//
+// It uses runtime/debug.ReadBuildInfo to find the main module path
+// (e.g. "github.com/user/repo"), then looks for that path component in
+// the working directory to determine the root. For example, if the module
+// path is "github.com/user/repo" and the binary was built from
+// "/home/user/src/github.com/user/repo", the prefix returned is
+// "/home/user/src/github.com/user/repo/".
+//
+// When running from an installed binary (CWD unrelated to source), it
+// returns just the module path suffix so it can be matched anywhere in
+// the source path.
+func detectSourcePrefix() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok || bi.Main.Path == "" {
+		return ""
+	}
+
+	// The main module path looks like "github.com/user/repo" or
+	// "github.com/user/repo/cmd/foo". We want the root module, which
+	// is the shortest path that appears in source file paths.
+	modPath := bi.Main.Path
+
+	// Try to locate the module root in the current working directory.
+	// This handles the "built from source" case where CWD contains
+	// the module path as a directory component.
+	if cwd, err := os.Getwd(); err == nil {
+		if idx := strings.Index(cwd, modPath); idx >= 0 {
+			return cwd[:idx+len(modPath)] + string(filepath.Separator)
+		}
+	}
+
+	// Fallback: return the module path so we can search for it in
+	// arbitrary source file paths (handles installed binaries where
+	// CWD is unrelated to the source tree).
+	return modPath
+}
+
+// trimSourcePath produces a clean, short source path for log output.
+//
+// Strategy (in order):
+//  1. If prefix is set and found in filePath, strip everything up to and
+//     including the prefix → "pkg/foo/bar.go"
+//  2. If workDir makes a clean relative path (no ".." prefix), use it
+//  3. Fall back to just the base filename
+func trimSourcePath(filePath, prefix, workDir string) string {
+	// Strategy 1: strip the detected module prefix
+	if prefix != "" {
+		if idx := strings.Index(filePath, prefix); idx >= 0 {
+			trimmed := filePath[idx+len(prefix):]
+			// Ensure no leading separator
+			trimmed = strings.TrimLeft(trimmed, "/"+string(filepath.Separator))
+			if trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+
+	// Strategy 2: try workDir-relative path
+	if workDir != "" {
+		if rel, err := filepath.Rel(workDir, filePath); err == nil && !strings.HasPrefix(rel, "..") {
+			return rel
+		}
+	}
+
+	// Strategy 3: basename only
+	return filepath.Base(filePath)
 }
