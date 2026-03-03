@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Handler is an slog.Handler that supports dynamic log levels and filter-based
@@ -16,10 +17,10 @@ type Handler struct {
 	globalLevel       *slog.LevelVar
 	filters           []LogFilter
 	filtersLock       sync.RWMutex
-	lowestLevel       slog.Level  // Cached lowest level from active filters
-	hasSourceFilters  bool        // Cached: true if any filter is source-based
-	preformattedAttrs []slog.Attr // Attributes added via WithAttrs
-	workDir           string      // Working directory for relative path calculation
+	lowestLevel       atomic.Int64 // Cached lowest level from active filters (stored as int64)
+	hasSourceFilters  bool         // Cached: true if any filter is source-based
+	preformattedAttrs []slog.Attr  // Attributes added via WithAttrs
+	workDir           string       // Working directory for relative path calculation
 }
 
 // NewHandler creates a new filter-aware handler wrapping the given inner handler.
@@ -32,9 +33,9 @@ func NewHandler(inner slog.Handler, globalLevel *slog.LevelVar) *Handler {
 	h := &Handler{
 		inner:       inner,
 		globalLevel: globalLevel,
-		lowestLevel: slog.LevelError + 1, // Higher than any valid level
 		workDir:     wd,
 	}
+	h.lowestLevel.Store(int64(slog.LevelError + 1)) // Higher than any valid level
 	return h
 }
 
@@ -89,7 +90,7 @@ func (h *Handler) ClearFilters() {
 	defer h.filtersLock.Unlock()
 
 	h.filters = nil
-	h.lowestLevel = slog.LevelError + 1
+	h.lowestLevel.Store(int64(slog.LevelError + 1))
 	h.hasSourceFilters = false
 }
 
@@ -97,21 +98,23 @@ func (h *Handler) ClearFilters() {
 // and checks if any source filters are present.
 // Must be called with filtersLock held.
 func (h *Handler) updateLowestLevel() {
-	h.lowestLevel = slog.LevelError + 1
+	lowest := slog.LevelError + 1
 	h.hasSourceFilters = false
 
-	for _, f := range h.filters {
+	for i := range h.filters {
+		h.filters[i].prepare()
+		f := &h.filters[i]
 		if !f.IsActive() {
 			continue
 		}
-		level := ParseLevel(f.Level)
-		if level < h.lowestLevel {
-			h.lowestLevel = level
+		if f.parsedLevel < lowest {
+			lowest = f.parsedLevel
 		}
-		if f.IsSourceFilter() {
+		if f.kind == filterKindSourceFile || f.kind == filterKindSourceFunction {
 			h.hasSourceFilters = true
 		}
 	}
+	h.lowestLevel.Store(int64(lowest))
 }
 
 // Enabled reports whether the handler handles records at the given level.
@@ -124,10 +127,9 @@ func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
 		return true
 	}
 
-	// Check if any filter could potentially enable this level
-	h.filtersLock.RLock()
-	lowestLevel := h.lowestLevel
-	h.filtersLock.RUnlock()
+	// Check if any filter could potentially enable this level.
+	// lowestLevel is updated atomically, no lock needed on the hot path.
+	lowestLevel := slog.Level(h.lowestLevel.Load())
 
 	return level >= lowestLevel
 }
@@ -137,20 +139,6 @@ func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
 func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 	effectiveLevel := h.globalLevel.Level()
 	var matchedFilter *LogFilter
-
-	// Collect attributes from record and preformatted attrs
-	attrs := make(map[string]string)
-
-	// Add preformatted attributes first
-	for _, a := range h.preformattedAttrs {
-		attrs[a.Key] = attrValueToString(a.Value)
-	}
-
-	// Add record attributes (may override preformatted)
-	r.Attrs(func(a slog.Attr) bool {
-		attrs[a.Key] = attrValueToString(a.Value)
-		return true
-	})
 
 	// Check filters (first match wins)
 	h.filtersLock.RLock()
@@ -164,6 +152,9 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 		sourceFile, sourceFunction = h.extractSource(r.PC)
 	}
 
+	// Attribute map is built lazily — only when an attribute filter is encountered.
+	var attrs map[string]string
+
 	for i := range filters {
 		f := &filters[i]
 		if !f.IsActive() {
@@ -173,25 +164,36 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 		var value string
 		var found bool
 
-		switch {
-		case f.IsSourceFileFilter():
+		switch f.kind {
+		case filterKindSourceFile:
 			// Match against source file path
 			value = sourceFile
 			found = sourceFile != ""
-		case f.IsSourceFunctionFilter():
+		case filterKindSourceFunction:
 			// Match against function name
 			value = sourceFunction
 			found = sourceFunction != ""
-		case f.IsContextFilter():
+		case filterKindContext:
 			// Extract from context
-			value, found = extractFromContext(ctx, f.ContextKey())
+			value, found = extractFromContext(ctx, f.contextKey)
 		default:
+			// Build the attribute map on first need
+			if attrs == nil {
+				attrs = make(map[string]string, len(h.preformattedAttrs)+r.NumAttrs())
+				for _, a := range h.preformattedAttrs {
+					attrs[a.Key] = attrValueToString(a.Value)
+				}
+				r.Attrs(func(a slog.Attr) bool {
+					attrs[a.Key] = attrValueToString(a.Value)
+					return true
+				})
+			}
 			// Check record attributes
-			value, found = attrs[f.AttributeKey()]
+			value, found = attrs[f.attributeKey]
 		}
 
 		if found && f.Matches(value) {
-			effectiveLevel = ParseLevel(f.Level)
+			effectiveLevel = f.parsedLevel
 			matchedFilter = f
 			break // First match wins
 		}
@@ -205,7 +207,7 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 	// Transform log level if filter specifies an output level
 	if matchedFilter != nil && matchedFilter.HasOutputLevel() {
 		// Create a new record with the transformed level
-		newRecord := slog.NewRecord(r.Time, matchedFilter.GetOutputLevel(r.Level), r.Message, r.PC)
+		newRecord := slog.NewRecord(r.Time, matchedFilter.cachedOutputLevel(r.Level), r.Message, r.PC)
 		r.Attrs(func(a slog.Attr) bool {
 			newRecord.AddAttrs(a)
 			return true
@@ -282,44 +284,40 @@ func (h *Handler) formatSourcePath(filePath, functionName string) string {
 
 // WithAttrs returns a new Handler with the given attributes added.
 func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	// Copy preformattedAttrs to avoid aliasing the parent's backing array.
+	merged := make([]slog.Attr, len(h.preformattedAttrs), len(h.preformattedAttrs)+len(attrs))
+	copy(merged, h.preformattedAttrs)
+	merged = append(merged, attrs...)
+
 	newHandler := &Handler{
 		inner:             h.inner.WithAttrs(attrs),
 		globalLevel:       h.globalLevel,
 		filters:           h.filters,
-		lowestLevel:       h.lowestLevel,
 		hasSourceFilters:  h.hasSourceFilters,
-		preformattedAttrs: append(h.preformattedAttrs, attrs...),
+		preformattedAttrs: merged,
 		workDir:           h.workDir,
 	}
+	newHandler.lowestLevel.Store(h.lowestLevel.Load())
 	return newHandler
 }
 
 // WithGroup returns a new Handler with the given group name.
 func (h *Handler) WithGroup(name string) slog.Handler {
-	return &Handler{
+	newHandler := &Handler{
 		inner:             h.inner.WithGroup(name),
 		globalLevel:       h.globalLevel,
 		filters:           h.filters,
-		lowestLevel:       h.lowestLevel,
 		hasSourceFilters:  h.hasSourceFilters,
 		preformattedAttrs: h.preformattedAttrs,
 		workDir:           h.workDir,
 	}
+	newHandler.lowestLevel.Store(h.lowestLevel.Load())
+	return newHandler
 }
 
 // attrValueToString converts an slog.Value to a string for pattern matching.
 func attrValueToString(v slog.Value) string {
 	switch v.Kind() {
-	case slog.KindString:
-		return v.String()
-	case slog.KindInt64:
-		return v.String()
-	case slog.KindUint64:
-		return v.String()
-	case slog.KindFloat64:
-		return v.String()
-	case slog.KindBool:
-		return v.String()
 	case slog.KindTime:
 		return v.Time().String()
 	case slog.KindDuration:

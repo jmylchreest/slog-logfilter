@@ -8,9 +8,19 @@ import (
 
 // Source filter type prefixes.
 const (
-	ContextPrefix       = "context:"
-	SourceFilePrefix    = "source:file"
+	ContextPrefix        = "context:"
+	SourceFilePrefix     = "source:file"
 	SourceFunctionPrefix = "source:function"
+)
+
+// filterKind classifies a filter's type for fast dispatch in the hot path.
+type filterKind int
+
+const (
+	filterKindAttribute      filterKind = iota // Match against record/preformatted attributes
+	filterKindSourceFile                       // Match against source file path
+	filterKindSourceFunction                   // Match against function name
+	filterKindContext                          // Match against context value
 )
 
 // LogFilter defines a log level override based on attribute matching.
@@ -48,6 +58,38 @@ type LogFilter struct {
 	// ExpiresAt is an optional expiry time for temporary filters.
 	// If nil or zero, the filter never expires.
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
+	// Cached fields — set by prepare(), not serialized.
+	kind              filterKind `json:"-"` // Pre-classified filter kind
+	parsedLevel       slog.Level `json:"-"` // Cached ParseLevel(Level)
+	parsedOutputLevel slog.Level `json:"-"` // Cached ParseLevel(OutputLevel)
+	contextKey        string     `json:"-"` // Cached context key (trimmed prefix)
+	attributeKey      string     `json:"-"` // Cached attribute key
+}
+
+// prepare pre-computes cached fields from the JSON-serializable fields.
+// Must be called after constructing or deserializing a LogFilter before use
+// in the hot path. Handler.SetFilters and Handler.AddFilter call this automatically.
+func (f *LogFilter) prepare() {
+	// Classify the filter kind
+	switch {
+	case f.Type == SourceFilePrefix:
+		f.kind = filterKindSourceFile
+	case f.Type == SourceFunctionPrefix:
+		f.kind = filterKindSourceFunction
+	case strings.HasPrefix(f.Type, ContextPrefix):
+		f.kind = filterKindContext
+		f.contextKey = strings.TrimPrefix(f.Type, ContextPrefix)
+	default:
+		f.kind = filterKindAttribute
+		f.attributeKey = f.Type
+	}
+
+	// Cache parsed levels
+	f.parsedLevel = ParseLevel(f.Level)
+	if f.OutputLevel != "" {
+		f.parsedOutputLevel = ParseLevel(f.OutputLevel)
+	}
 }
 
 // IsExpired returns true if the filter has expired.
@@ -118,6 +160,21 @@ func (f *LogFilter) GetOutputLevel(originalLevel slog.Level) slog.Level {
 		return originalLevel
 	}
 	return ParseLevel(f.OutputLevel)
+}
+
+// cachedParsedLevel returns the pre-computed parsed level.
+// Only valid after prepare() has been called.
+func (f *LogFilter) cachedParsedLevel() slog.Level {
+	return f.parsedLevel
+}
+
+// cachedOutputLevel returns the pre-computed output level, or the original level if not set.
+// Only valid after prepare() has been called.
+func (f *LogFilter) cachedOutputLevel(originalLevel slog.Level) slog.Level {
+	if f.OutputLevel == "" {
+		return originalLevel
+	}
+	return f.parsedOutputLevel
 }
 
 // ParseLevel converts a level string to slog.Level.
