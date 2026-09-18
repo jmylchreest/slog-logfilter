@@ -319,3 +319,40 @@ The handler is optimized for minimal overhead:
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
+## Sanitizing output
+
+Sanitization is opt-in and happens after filter matching, before JSON/text
+formatting. Filters continue to match original attributes. Child loggers share
+runtime filter updates and sanitize attributes supplied through `With` and groups.
+
+```go
+redactor := logfilter.NewRedactor(logfilter.RedactorOptions{
+    SensitiveKeys: []string{"signing_key"},
+    // Patterns can add application-specific token formats.
+})
+logger := logfilter.New(logfilter.WithSanitizer(redactor))
+logger.Info("request", "authorization", "Bearer sensitive-value")
+// authorization is [redacted]
+```
+
+`Sanitizer` exposes `SanitizeText(string) string` and
+`SanitizeAttr(groups []string, attr slog.Attr) slog.Attr`. Custom implementations
+must be concurrent-safe and leave input records/objects unchanged.
+`SanitizingHandler` can wrap a custom output handler as well.
+
+The supplied `Redactor` replaces common credential fields, bearer/basic auth,
+private-key blocks, credential assignments and URL userinfo/sensitive query
+parameters. It recursively sanitizes groups, LogValuer results and JSON-shaped
+objects. Byte slices are treated as text. Unserializable/cyclic objects are
+replaced with `[unloggable]`; application structs are converted to safe JSON-shaped
+data rather than passed to the formatter. Ordinary scalar attributes retain
+their types. Sensitive group names cause their contents to be redacted.
+
+`SanitizeError(err, redactor)` protects ordinary and formatted error text while
+preserving `errors.Is`/`errors.As` through `Unwrap`. Trusted code can still recover
+the original error; do not expose that unwrapped value outside the trust boundary.
+
+This is defense in depth, not a guarantee that arbitrary prose contains no secret.
+Avoid logging raw payloads. No runtime secret registry is retained. Redactor rules
+are fixed at construction; configure additional keys/patterns before use.

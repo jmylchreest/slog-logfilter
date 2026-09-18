@@ -63,12 +63,13 @@ var (
 type Option func(*options)
 
 type options struct {
-	level   slog.Level
-	format  string // "json" or "text"
-	output  io.Writer
-	source  bool
-	workDir string
-	filters []LogFilter
+	sanitizer Sanitizer
+	level     slog.Level
+	format    string // "json" or "text"
+	output    io.Writer
+	source    bool
+	workDir   string
+	filters   []LogFilter
 }
 
 // WithLevel sets the initial log level.
@@ -146,7 +147,7 @@ func New(opts ...Option) *slog.Logger {
 		inner = slog.NewJSONHandler(o.output, handlerOpts)
 	}
 
-	handler := NewHandler(inner, defaultLevel)
+	handler := NewHandler(SanitizingHandler(inner, o.sanitizer), defaultLevel)
 
 	// Apply initial filters if provided
 	if len(o.filters) > 0 {
