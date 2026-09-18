@@ -13,14 +13,19 @@ import (
 // Handler is an slog.Handler that supports dynamic log levels and filter-based
 // level overrides. It wraps an inner handler and checks filters before delegating.
 type Handler struct {
-	inner             slog.Handler
-	globalLevel       *slog.LevelVar
-	filters           []LogFilter
-	filtersLock       sync.RWMutex
-	lowestLevel       atomic.Int64 // Cached lowest level from active filters (stored as int64)
-	hasSourceFilters  bool         // Cached: true if any filter is source-based
-	preformattedAttrs []slog.Attr  // Attributes added via WithAttrs
-	workDir           string       // Working directory for relative path calculation
+	inner       slog.Handler
+	globalLevel *slog.LevelVar
+	*filterState
+	preformattedAttrs []slog.Attr // Attributes added via WithAttrs
+	workDir           string      // Working directory for relative path calculation
+}
+
+// filterState is shared by child handlers so runtime updates remain live.
+type filterState struct {
+	filters          []LogFilter
+	filtersLock      sync.RWMutex
+	lowestLevel      atomic.Int64 // Cached lowest level from active filters (stored as int64)
+	hasSourceFilters bool         // Cached: true if any filter is source-based
 }
 
 // NewHandler creates a new filter-aware handler wrapping the given inner handler.
@@ -32,6 +37,7 @@ func NewHandler(inner slog.Handler, globalLevel *slog.LevelVar) *Handler {
 	}
 	h := &Handler{
 		inner:       inner,
+		filterState: &filterState{},
 		globalLevel: globalLevel,
 		workDir:     wd,
 	}
@@ -65,7 +71,7 @@ func (h *Handler) AddFilter(filter LogFilter) {
 	h.filtersLock.Lock()
 	defer h.filtersLock.Unlock()
 
-	h.filters = append(h.filters, filter)
+	h.filters = append(append([]LogFilter(nil), h.filters...), filter)
 	h.updateLowestLevel()
 }
 
@@ -292,12 +298,10 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	newHandler := &Handler{
 		inner:             h.inner.WithAttrs(attrs),
 		globalLevel:       h.globalLevel,
-		filters:           h.filters,
-		hasSourceFilters:  h.hasSourceFilters,
+		filterState:       h.filterState,
 		preformattedAttrs: merged,
 		workDir:           h.workDir,
 	}
-	newHandler.lowestLevel.Store(h.lowestLevel.Load())
 	return newHandler
 }
 
@@ -306,12 +310,10 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 	newHandler := &Handler{
 		inner:             h.inner.WithGroup(name),
 		globalLevel:       h.globalLevel,
-		filters:           h.filters,
-		hasSourceFilters:  h.hasSourceFilters,
+		filterState:       h.filterState,
 		preformattedAttrs: h.preformattedAttrs,
 		workDir:           h.workDir,
 	}
-	newHandler.lowestLevel.Store(h.lowestLevel.Load())
 	return newHandler
 }
 
