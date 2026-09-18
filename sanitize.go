@@ -81,8 +81,8 @@ type Redactor struct {
 var urlPattern = regexp.MustCompile(`https?://[^\s<>"']+`)
 var defaultPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b(?:bearer|basic)\s+[a-z0-9._~+/=-]+`),
-	regexp.MustCompile(`(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`),
-	regexp.MustCompile(`(?i)\b(?:password|passwd|client[_-]?secret|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|cookie|set-cookie)\b["']?\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s&,;]+)`),
+	regexp.MustCompile(`(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)`),
+	regexp.MustCompile(`(?i)\b(?:token|secret|password|passwd|client[_-]?secret|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|cookie|set-cookie)\b["']?\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s&,;]+)`),
 }
 
 // NewRedactor returns an immutable redactor with defaults plus opts' rules.

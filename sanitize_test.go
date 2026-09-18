@@ -172,3 +172,12 @@ func BenchmarkUnsanitizedLogging(b *testing.B) {
 		})
 	}
 }
+
+func TestRedactorRawQueryAndTruncatedKey(t *testing.T) {
+	r := NewRedactor(RedactorOptions{})
+	for _, text := range []string{"token=secret-value", "secret=secret-value", "-----BEGIN PRIVATE KEY-----\nsecret-value"} {
+		if got := r.SanitizeText(text); strings.Contains(got, "secret-value") {
+			t.Fatal(got)
+		}
+	}
+}
