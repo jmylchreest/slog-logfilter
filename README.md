@@ -12,6 +12,7 @@ A dynamic, filter-based logging library for Go's `log/slog`. Enables runtime log
 - **Optional expiry** - Temporary filters with automatic expiration
 - **First match wins** - Predictable filter ordering
 - **Thread-safe** - Safe for concurrent use
+- **Optional sanitisation** - Redact sensitive fields and matching text before output
 
 ## Installation
 
@@ -200,6 +201,151 @@ Source extraction only occurs when source-based filters are configured. If you h
 ]
 ```
 
+## Optional Sanitisation
+
+See the API comments for `SanitiserRule`, `NewSanitiser`, and `WithSanitisers`,
+or browse the [executable GoDoc examples](sanitiser_example_test.go). Locally,
+`go doc SanitiserRule` shows callback and matching semantics;
+`go test -run Example ./...` verifies all example outputs.
+
+Sanitisation is disabled by default. Enable the built-in rules, optionally adding
+your own Go regular expressions:
+
+```go
+rules := logfilter.DefaultSanitiserRules()
+rules = append(rules, logfilter.SanitiserRule{
+    KeyPattern: `(?i)^customer_email$`, // Match this attribute at any group depth
+    Replacement: "[PRIVATE]",
+})
+rules = append(rules, logfilter.SanitiserRule{
+    Pattern: `\baccount-[0-9]+\b`, // Replace matching substrings in messages and strings
+})
+sanitiser, err := logfilter.NewSanitiser(rules...)
+if err != nil {
+    return err // Invalid configuration: do not start an unsanitised logger
+}
+logger := logfilter.New(logfilter.WithSanitiser(sanitiser))
+logger.Info("processing 550e8400-e29b-41d4-a716-446655440000",
+    "username", "alice", "password", "secret", "count", 3)
+// msg="processing [REDACTED]" username=[REDACTED] password=[REDACTED] count=3
+```
+
+The defaults redact UUIDs, card-like numbers (13–19 digits, optionally separated
+by spaces or hyphens), credential fields such as `username`, `user_id`, `password`,
+`api_key`, `authorization`, and `card_number`, labelled credentials such as
+`password=secret` or `username="Alice Smith"`, and Bearer tokens. Card matching
+uses a callback to validate the Luhn checksum, but does not validate issuers and
+may also redact numeric IDs with valid checksums. Invalid card-like text is left
+unchanged; explicit card fields are always redacted. Unlabelled
+usernames and passwords cannot be reliably detected; use structured fields or
+application-specific patterns.
+
+Phone numbers, email addresses and provider-specific API key formats are not
+explicitly detected by the defaults. Add field rules for your own attribute names
+or text patterns/callbacks for the formats your application uses.
+
+| Rule fields | Behaviour |
+|-------------|-----------|
+| `KeyPattern` only | Replace the entire value, regardless of type |
+| `Pattern` only | Replace matched substrings in messages and string attributes |
+| Both | Replace matched substrings in string attributes with matching keys |
+| `Replacement` | Literal replacement text; empty defaults to `[REDACTED]` (no `$1` expansion) |
+| `Pattern` + `ReplaceFunc` | Call the function for each complete regex match |
+| `ReplaceFunc` without `Pattern` | Call the function with the whole string; optionally restrict by `KeyPattern` |
+
+Key patterns match local attribute names, not dotted group paths; use `^` and `$`
+for whole-key matching. Matching is case-sensitive unless the pattern uses `(?i)`.
+Whole-field rules take precedence (first match wins); text rules run sequentially.
+Rules have JSON fields `key_pattern`, `pattern`, and `replacement`, and are compiled
+once by `NewSanitiser`. Sanitisers are immutable and safe to share across loggers
+provided any custom callbacks are safe for concurrent use.
+Pass only your custom rules to omit the defaults, or `WithSanitiser(nil)` to disable.
+
+Use multiple independently configured sanitisers on the same logger:
+
+```go
+credentials, err := logfilter.NewSanitiser(logfilter.SanitiserRule{
+    KeyPattern: `(?i)^(password|api_key)$`,
+    Replacement: "[SECRET]",
+})
+if err != nil {
+    return err
+}
+identities, err := logfilter.NewSanitiser(logfilter.SanitiserRule{
+    KeyPattern: `(?i)^(username|user_id)$`,
+    Replacement: "[PERSON]",
+})
+if err != nil {
+    return err
+}
+logger := logfilter.New(logfilter.WithSanitisers(credentials, identities))
+logger.Info("login", "username", "alice", "password", "secret")
+// username=[PERSON] password=[SECRET]
+```
+
+Sanitisers run in the supplied order, each processing the previous one's output,
+including replacement text. They retain their individual rule precedence; rules
+are not merged. Each logger can choose its own combination, and immutable
+sanitisers can be shared across loggers. Nil and empty sanitisers are skipped.
+The last `WithSanitiser` or `WithSanitisers` option replaces earlier configuration;
+`WithSanitisers()` disables sanitisation. `WithSanitiser(s)` remains shorthand for
+`WithSanitisers(s)`. Custom handlers also accept multiple sanitisers via
+`NewSanitisingHandler(inner, credentials, identities)`.
+
+Rules can use `ReplaceFunc` for validation or calculated replacements. With a
+`Pattern`, the function receives each complete regex match. Return the match
+unchanged to keep it, an empty string to remove it, or replacement text to redact
+or mask it. Returned text is literal, including `$` characters.
+
+Use a whole-field rule to replace an attribute's entire value, a regex for recognisable text,
+and a callback when validation or calculated masking is required. The default
+card rule combines a candidate regex with a Luhn-checking callback. Custom rules
+can use the same approach for application-specific key formats or phone numbers.
+
+```go
+rule := logfilter.SanitiserRule{
+    KeyPattern: `(?i)^api[_-]?key$`,
+    ReplaceFunc: func(value string) string {
+        if len(value) < 8 {
+            return logfilter.Redaction
+        }
+        return "[KEY]..." + value[len(value)-4:]
+    },
+}
+```
+
+Without `Pattern`, the callback receives the entire string. `KeyPattern` limits
+it to matching string attributes; omit that too to process all string attributes
+and messages. Callbacks skip non-string values and run in text-rule order, after
+whole-field redaction rules. They also apply to nested groups, resolved string
+`LogValuer` values and attributes bound with `With` (at binding time).
+
+`ReplaceFunc` and a non-empty `Replacement` are mutually exclusive. Callbacks
+must be safe for concurrent calls; callback panics propagate. Functions are Go-only
+and omitted from JSON: serialising and reloading rules does not preserve callbacks.
+Reattach them in code before constructing the sanitiser. The default card-number
+rule uses this same callback API for Luhn validation; the other defaults use regex
+or whole-field replacement.
+
+Filters match original values before sanitisation, including values supplied via
+`logger.With`. Sanitisation covers messages, `With` attributes, nested slog groups,
+and resolved `slog.LogValuer` values in JSON and text output. Unmatched primitive
+values keep their original types. It does not scan attribute names, context values,
+source metadata, or opaque `slog.Any` values such as maps, structs, slices and errors.
+Redact opaque values by key, or expose their fields as slog groups/`LogValuer` values.
+Custom downstream handlers can add data after sanitisation.
+
+For a custom handler, install the sanitiser before binding any attributes to it:
+
+```go
+inner := slog.NewJSONHandler(output, nil)
+safe := logfilter.NewSanitisingHandler(inner, sanitiser)
+handler := logfilter.NewHandler(safe, levelVar)
+logger := slog.New(handler)
+```
+
+Attributes already bound directly to `inner` cannot be sanitised by the wrapper.
+
 ## Runtime API
 
 ```go
@@ -310,11 +456,19 @@ func refreshFilters(ctx context.Context, s3Client *s3.Client) {
 
 The handler is optimized for minimal overhead:
 
-- **Fast path**: If log level >= global level, no filter checking needed
-- **Cached lowest level**: Quick check if any filter could match
-- **Simple patterns**: No regex, just string prefix/suffix/contains
-- **Lock-free reads**: RWMutex for concurrent filter access
+- **Early level checks**: `Enabled` uses the global level and cached lowest filter level; `Handle` still checks suppression filters
+- **Simple filter patterns**: Level filters use string prefix/suffix/contains matching
+- **Concurrent filter access**: Lock-free cached level reads, with an RWMutex protecting immutable filter snapshots
 - **Lazy source extraction**: Source file/function only extracted when source filters are configured
+- **Output level changes**: Update a record copy without rebuilding its attributes
+- **Opt-in sanitisation**: Disabled sanitisers add no handler wrapper; enabled sanitisers reuse unchanged strings, groups and record attributes
+
+Sanitiser regexes are compiled once. Matching rules and callbacks still have a
+per-record cost; checking for matches before replacing strings reduces allocations
+for ordinary logs but can add work to logs containing many sensitive values.
+Use `go test -run '^$' -bench . -benchmem` to measure the included workloads on
+your own hardware. Attributes supplied with `logger.With` are sanitised at binding
+time, so their sanitisation work is not repeated for every record.
 
 ## License
 

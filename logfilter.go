@@ -6,6 +6,7 @@
 //   - Context value extraction for filtering
 //   - Simple glob-style pattern matching (prefix*, *suffix, *contains*)
 //   - Optional filter expiry for temporary debugging
+//   - Opt-in output sanitisation using regular expressions and custom callbacks
 //
 // Basic usage:
 //
@@ -38,6 +39,19 @@
 //	logfilter.AddFilter(logfilter.LogFilter{
 //	    Type: "context:user_id", Pattern: "user_123", Level: "debug", Enabled: true,
 //	})
+//
+// # Sanitisation
+//
+// Sanitisation is disabled by default. Construct rules with [NewSanitiser] and
+// enable them with [WithSanitiser] or [WithSanitisers]. [DefaultSanitiserRules]
+// supplies opt-in credential, UUID, Bearer token and Luhn-validated card rules.
+// [SanitiserRule.ReplaceFunc] supports custom validation and calculated replacements.
+//
+// Filters match original values before output sanitisation. Whole-field rules
+// can replace any attribute type; text rules process messages and string values,
+// including nested slog groups and resolved LogValuer values. Opaque maps,
+// structs and errors require whole-field redaction or conversion to slog groups.
+// See [NewSanitisingHandler] for custom handler integration and coverage limits.
 package logfilter
 
 import (
@@ -63,12 +77,13 @@ var (
 type Option func(*options)
 
 type options struct {
-	level   slog.Level
-	format  string // "json" or "text"
-	output  io.Writer
-	source  bool
-	workDir string
-	filters []LogFilter
+	level      slog.Level
+	format     string // "json" or "text"
+	output     io.Writer
+	source     bool
+	workDir    string
+	filters    []LogFilter
+	sanitisers []*Sanitiser
 }
 
 // WithLevel sets the initial log level.
@@ -104,6 +119,21 @@ func WithFilters(filters []LogFilter) Option {
 	return func(o *options) {
 		o.filters = filters
 	}
+}
+
+// WithSanitiser enables optional output sanitisation. A nil sanitiser disables it.
+// Filters still match the original, unsanitised values.
+func WithSanitiser(s *Sanitiser) Option {
+	return WithSanitisers(s)
+}
+
+// WithSanitisers sets the output sanitisers in application order. Each sanitiser
+// receives the preceding one's output. Nil and empty sanitisers are ignored.
+// This replaces any earlier WithSanitiser or WithSanitisers option; no arguments
+// disables sanitisation. The supplied slice is copied and can be reused safely.
+func WithSanitisers(sanitisers ...*Sanitiser) Option {
+	snapshot := append([]*Sanitiser(nil), sanitisers...)
+	return func(o *options) { o.sanitisers = snapshot }
 }
 
 // New creates a new slog.Logger with filter support.
@@ -146,6 +176,7 @@ func New(opts ...Option) *slog.Logger {
 		inner = slog.NewJSONHandler(o.output, handlerOpts)
 	}
 
+	inner = NewSanitisingHandler(inner, o.sanitisers...)
 	handler := NewHandler(inner, defaultLevel)
 
 	// Apply initial filters if provided
