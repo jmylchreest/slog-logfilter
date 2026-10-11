@@ -65,7 +65,12 @@ func (h *Handler) AddFilter(filter LogFilter) {
 	h.filtersLock.Lock()
 	defer h.filtersLock.Unlock()
 
-	h.filters = append(h.filters, filter)
+	// Published filter slices are read after releasing filtersLock, and may also
+	// belong to derived handlers. Never re-prepare their cached fields in place.
+	filters := make([]LogFilter, len(h.filters)+1)
+	copy(filters, h.filters)
+	filters[len(h.filters)] = filter
+	h.filters = filters
 	h.updateLowestLevel()
 }
 
@@ -288,9 +293,12 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	merged := make([]slog.Attr, len(h.preformattedAttrs), len(h.preformattedAttrs)+len(attrs))
 	copy(merged, h.preformattedAttrs)
 	merged = append(merged, attrs...)
+	inner := h.inner.WithAttrs(attrs)
+	h.filtersLock.RLock()
+	defer h.filtersLock.RUnlock()
 
 	newHandler := &Handler{
-		inner:             h.inner.WithAttrs(attrs),
+		inner:             inner,
 		globalLevel:       h.globalLevel,
 		filters:           h.filters,
 		hasSourceFilters:  h.hasSourceFilters,
@@ -303,8 +311,11 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 // WithGroup returns a new Handler with the given group name.
 func (h *Handler) WithGroup(name string) slog.Handler {
+	inner := h.inner.WithGroup(name)
+	h.filtersLock.RLock()
+	defer h.filtersLock.RUnlock()
 	newHandler := &Handler{
-		inner:             h.inner.WithGroup(name),
+		inner:             inner,
 		globalLevel:       h.globalLevel,
 		filters:           h.filters,
 		hasSourceFilters:  h.hasSourceFilters,
