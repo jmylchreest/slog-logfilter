@@ -211,13 +211,9 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 
 	// Transform log level if filter specifies an output level
 	if matchedFilter != nil && matchedFilter.HasOutputLevel() {
-		// Create a new record with the transformed level
-		newRecord := slog.NewRecord(r.Time, matchedFilter.cachedOutputLevel(r.Level), r.Message, r.PC)
-		r.Attrs(func(a slog.Attr) bool {
-			newRecord.AddAttrs(a)
-			return true
-		})
-		return h.inner.Handle(ctx, newRecord)
+		// r is passed by value: changing its level does not modify the caller's
+		// record or its attribute storage, so no attribute copy is needed.
+		r.Level = matchedFilter.cachedOutputLevel(r.Level)
 	}
 
 	return h.inner.Handle(ctx, r)
