@@ -57,13 +57,15 @@
 //
 // Sanitisation is disabled by default. Construct rules with [NewSanitiser] and
 // enable them with [WithSanitiser] or [WithSanitisers]. [DefaultSanitiserRules]
-// supplies opt-in credential, UUID, Bearer token and Luhn-validated card rules.
+// supplies opt-in credential, URL, private-key, UUID and Luhn-validated card rules.
 // [SanitiserRule.ReplaceFunc] supports custom validation and calculated replacements.
 //
 // Filters match original values before output sanitisation. Whole-field rules
 // can replace any attribute type; text rules process messages and string values,
 // including nested slog groups and resolved LogValuer values. Opaque maps,
-// structs and errors require whole-field redaction or conversion to slog groups.
+// structs and errors require whole-field redaction, conversion to slog groups,
+// or explicit object conversion with [NewSanitiserWithConfig]. [SanitiseError]
+// sanitises displayed errors while retaining their identity through Unwrap.
 // See [NewSanitisingHandler] for custom handler integration and coverage limits.
 package logfilter
 

@@ -13,6 +13,10 @@ Applications must migrate as described below.
   registration, lookup and removal methods support live registry updates.
 - `NewSanitiser`, `SanitiserRule`, `WithSanitiser`, `WithSanitisers` and
   `NewSanitisingHandler` support reusable, ordered sanitisation configurations.
+- Consolidated the merged PR's credential coverage into the same rule engine.
+  `NewSanitiserWithConfig` adds explicit object conversion and key scanning;
+  `SanitiseText`, `SanitiseAttr` and `SanitiseError` support direct use.
+  Error wrappers preserve `errors.Is`/`errors.As` via `Unwrap`.
 - Rules support field-name and value regexes, literal replacement text and
   `ReplaceFunc` callbacks for custom validation and masking.
 - GoDoc examples, race and compatibility tests, allocation benchmarks, a CI
@@ -21,19 +25,25 @@ Applications must migrate as described below.
 ### Default sanitisation policy
 
 - Disabled unless explicitly configured. `DefaultSanitiserRules()` is opt-in.
-- Redacts named credential fields, labelled credentials, Bearer tokens and
-  hyphenated UUIDs. Quoted credentials support escaped quotes.
+- Redacts named credential fields, labelled credentials, Bearer/Basic authentication,
+  HTTP(S) URL credentials and sensitive query parameters, private-key blocks
+  (including truncated blocks), and hyphenated UUIDs. Quoted credentials support
+  escaped quotes. Credential fields include cookies, client secrets and private keys.
 - Card-like strings must have 13–19 digits and a valid Luhn checksum; explicit
   card fields are redacted even when their values are invalid. Issuers are not
   checked. Other numeric IDs with valid checksums may also be redacted.
 - No explicit phone, email, IP-address or provider-specific API-key detection.
 - Applies to messages, bound attributes, nested slog groups and resolved
-  LogValuer values. Opaque maps, structs, slices and errors require whole-field
-  rules or conversion to slog groups. Attribute names, source metadata, context
-  contents and data added by downstream handlers are not scanned.
+  LogValuer values. Matching enclosing group names also protect their attributes.
+  Opaque objects require whole-field rules, slog groups, or explicit
+  `SanitiseObjects` configuration. That option converts through JSON and replaces
+  failed/cyclic/panicking encoders with `[unloggable]`. Name scanning requires
+  `SanitiseKeys`. Source metadata, context contents and data added by downstream
+  handlers are not scanned.
 - Callbacks are concurrent user code, may return the input unchanged or remove
   matches with an empty result, and propagate panics. JSON does not preserve them;
-  reattach functions after loading configuration, including default Luhn checking.
+  reattach functions after loading configuration, including default Luhn checking
+  and URL parsing.
 
 ### Fixed and optimised
 
@@ -68,5 +78,9 @@ Applications must migrate as described below.
   `LevelVar` to separate handlers still shares only the level explicitly.
 - Sanitisers remain immutable and opt-in; log output without sanitisation is
   unchanged when the same effective configuration is used.
+- The merged PR's unreleased redactor/interface API is consolidated into
+  `Sanitiser`, `SanitiserConfig` and `SanitiserRule`, with British spelling.
+  Use `NewSanitiserWithConfig` and opt into object/name scanning to retain that
+  coverage. Custom patterns become rules; replacement text is `[REDACTED]`.
 - Future default sanitiser policy changes will be described in release notes.
   Supply explicit rules when log-output stability requires a fixed policy.

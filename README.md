@@ -123,6 +123,12 @@ Version 0.3.0 intentionally breaks the package-level configuration API:
 - Filter changes now reach existing children. Construct separate loggers with
   explicit configuration if you previously relied on child filter snapshots.
 
+The previously merged, unreleased PR API is consolidated into these sanitisers.
+Replace its redactor construction with `NewSanitiserWithConfig` (shown below), append
+custom `SanitiserRule` entries, and use `WithSanitiser`, `NewSanitisingHandler`
+and `SanitiseError`. Replacement text is consistently `[REDACTED]`. Object
+conversion and name scanning now require their explicit config flags.
+
 See [CHANGELOG.md](CHANGELOG.md) for the full release notes.
 
 ## Filter Configuration
@@ -314,7 +320,10 @@ logger.Info("processing 550e8400-e29b-41d4-a716-446655440000",
 The defaults redact UUIDs, card-like numbers (13–19 digits, optionally separated
 by spaces or hyphens), credential fields such as `username`, `user_id`, `password`,
 `api_key`, `authorization`, and `card_number`, labelled credentials such as
-`password=secret` or `username="Alice Smith"`, and Bearer tokens. Card matching
+`password=secret` or `username="Alice Smith"`, Bearer/Basic authentication,
+HTTP(S) URL userinfo and sensitive query parameters,
+and private-key blocks (including truncated blocks). Credential names also include
+client secrets, cookies, private keys and proxy authorisation. Card matching
 uses a callback to validate the Luhn checksum, but does not validate issuers and
 may also redact numeric IDs with valid checksums. Invalid card-like text is left
 unchanged; explicit card fields are always redacted. Unlabelled
@@ -405,16 +414,47 @@ whole-field redaction rules. They also apply to nested groups, resolved string
 must be safe for concurrent calls; callback panics propagate. Functions are Go-only
 and omitted from JSON: serialising and reloading rules does not preserve callbacks.
 Reattach them in code before constructing the sanitiser. The default card-number
-rule uses this same callback API for Luhn validation; the other defaults use regex
-or whole-field replacement.
+rule uses this callback API for Luhn validation, and the URL rule uses it to parse
+userinfo and query parameters. The other defaults use regex or whole-field
+replacement. URL query recognition uses default credential names; custom field
+rules do not automatically add query-parameter names.
 
 Filters match original values before sanitisation, including values supplied via
 `logger.With`. Sanitisation covers messages, `With` attributes, nested slog groups,
 and resolved `slog.LogValuer` values in JSON and text output. Unmatched primitive
-values keep their original types. It does not scan attribute names, context values,
-source metadata, or opaque `slog.Any` values such as maps, structs, slices and errors.
-Redact opaque values by key, or expose their fields as slog groups/`LogValuer` values.
-Custom downstream handlers can add data after sanitisation.
+values keep their original types. Context values and source metadata are not scanned,
+and custom downstream handlers can add data after sanitisation. Whole-field rules
+also protect attributes beneath matching `WithGroup` names.
+
+By default, attribute names and opaque `slog.Any` values (maps, structs, slices and
+errors) are not scanned. Redact opaque values by key or expose slog groups.
+For payload conversion and name scanning, opt in explicitly:
+
+```go
+sanitiser, err := logfilter.NewSanitiserWithConfig(logfilter.SanitiserConfig{
+    Rules:           logfilter.DefaultSanitiserRules(),
+    SanitiseObjects: true,
+    SanitiseKeys:    true,
+})
+if err != nil {
+    return err
+}
+logger := logfilter.New(logfilter.WithSanitiser(sanitiser))
+```
+
+`SanitiseObjects` converts opaque objects through JSON, then applies the same rules
+recursively. It preserves JSON numbers without converting them to floating point.
+Errors and byte slices become sanitised strings. Cycles, encoding failures and
+panicking encoders become `[unloggable]`; rule callback panics still propagate.
+This option changes output types and adds allocations. `SanitiseKeys` also applies
+unrestricted text rules to attribute and group names, which can change the schema.
+Key-specific selection always uses original names within each sanitiser.
+
+Use `sanitiser.SanitiseText(text)` or `sanitiser.SanitiseAttr(groups, attr)` for direct
+use outside a handler. `logfilter.SanitiseError(err, sanitisers...)` sanitises error
+text, including formatted output, while preserving `errors.Is`/`errors.As` through
+`Unwrap`. Unwrapping intentionally exposes the original error to trusted code;
+original custom formatter details are replaced by sanitised error text.
 
 For a custom handler, install the sanitiser before binding any attributes to it:
 

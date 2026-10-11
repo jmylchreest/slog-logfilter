@@ -15,7 +15,9 @@ const Redaction = "[REDACTED]"
 // expressions, not glob patterns.
 //
 // A KeyPattern without Pattern or ReplaceFunc replaces the entire matching value,
-// including groups and non-string values. Other rules process strings only.
+// including groups and non-string values. It also redacts attributes inside
+// a matching WithGroup. Other rules process strings only (including strings
+// decoded from objects when SanitiserConfig.SanitiseObjects is enabled).
 // Without KeyPattern, text rules apply to messages and all string attributes.
 //
 // Whole-field replacement takes precedence over text rules; see [Sanitiser].
@@ -53,7 +55,26 @@ type sanitiserRule struct {
 // that attribute. Otherwise text rules run in order on the preceding result.
 // This ordering applies within each sanitiser. [WithSanitisers] applies separate
 // sanitisers in the supplied order, including to earlier replacement text.
-type Sanitiser struct{ rules []sanitiserRule }
+type Sanitiser struct {
+	rules           []sanitiserRule
+	sanitiseObjects bool
+	sanitiseKeys    bool
+}
+
+// SanitiserConfig controls rule evaluation and optional structural conversion.
+// No default rules are added automatically.
+type SanitiserConfig struct {
+	Rules []SanitiserRule
+	// SanitiseObjects converts opaque Any values through JSON before applying
+	// rules recursively. Errors and byte slices become sanitised strings.
+	// Failed or panicking encoders and cyclic objects become "[unloggable]".
+	// This changes output types and adds allocations; it is disabled by default.
+	SanitiseObjects bool
+	// SanitiseKeys applies unrestricted text rules to attribute names and group
+	// names too. KeyPattern selection always uses the original names.
+	// This can change the output schema; it is disabled by default.
+	SanitiseKeys bool
+}
 
 // NewSanitiser validates and compiles rules once, returning no sanitiser on error.
 // It rejects invalid regular expressions, rules without any matcher or callback,
@@ -65,7 +86,14 @@ type Sanitiser struct{ rules []sanitiserRule }
 // opt into them, then install the result with [WithSanitiser], [WithSanitisers],
 // or [NewSanitisingHandler].
 func NewSanitiser(rules ...SanitiserRule) (*Sanitiser, error) {
-	s := &Sanitiser{}
+	return NewSanitiserWithConfig(SanitiserConfig{Rules: rules})
+}
+
+// NewSanitiserWithConfig constructs an immutable sanitiser with explicit
+// structural options. Rules have the same validation and ordering as NewSanitiser.
+func NewSanitiserWithConfig(config SanitiserConfig) (*Sanitiser, error) {
+	s := &Sanitiser{sanitiseObjects: config.SanitiseObjects, sanitiseKeys: config.SanitiseKeys}
+	rules := config.Rules
 	for i, rule := range rules {
 		if rule.KeyPattern == "" && rule.Pattern == "" && rule.ReplaceFunc == nil {
 			return nil, fmt.Errorf("sanitiser rule %d: key_pattern, pattern or replace function is required", i)
@@ -96,20 +124,26 @@ func NewSanitiser(rules ...SanitiserRule) (*Sanitiser, error) {
 }
 
 // DefaultSanitiserRules returns a fresh set of opt-in rules for UUIDs,
-// credential fields, labelled credentials in text, and card-like numbers.
+// credential fields, labelled credentials, Bearer/Basic authentication, HTTP(S)
+// URL credentials, private-key blocks (including truncated blocks), and card-like numbers.
 // Card matching uses 13–19 digits with optional spaces or hyphens, followed by
 // Luhn checksum validation. It does not validate issuers and can redact other IDs
 // with valid checksums. Explicit card fields are redacted regardless of validity.
 // These rules cannot identify arbitrary unlabelled usernames or passwords.
 // Phone numbers, email addresses, and provider-specific API key formats are not
 // explicitly detected. API key fields named api_key or apiKey are redacted.
-// The card rule includes a ReplaceFunc callback, which is lost if rules are
-// serialised to JSON; call this function again to retain the built-in behaviour.
+// URL parsing and card validation use ReplaceFunc callbacks, which are lost if
+// rules are serialised to JSON; call this function again to retain the behaviour.
+// URL query recognition uses the default credential names. Add a custom callback
+// for application-specific query parameters.
 func DefaultSanitiserRules() []SanitiserRule {
 	return []SanitiserRule{
-		{KeyPattern: `(?i)^(user_?name|user_?id|password|passwd|pwd|secret|token|access_?token|refresh_?token|api_?key|authorization|credit_?card|card_?number|cvv|cvc)$`},
-		{Pattern: `(?i)\bbearer\s+[a-z0-9._~+/-]+=*`},
-		{Pattern: `(?i)\b(username|user_name|password|passwd|pwd|secret|token|access_token|refresh_token|api_key|authorization)\s*[:=]\s*("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,;]+)`},
+		{KeyPattern: "(?i)^(" + credentialNames + ")$"},
+		// URLs must be parsed before assignment rules alter their query strings.
+		{Pattern: `(?i)https?://[^\s<>"']+`, ReplaceFunc: redactURL},
+		{Pattern: `(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)`},
+		{Pattern: `(?i)\b(?:bearer|basic)\s+[a-z0-9._~+/=-]+`},
+		{Pattern: "(?i)\\b(" + credentialNames + `)\b["']?\s*[:=]\s*("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s&,;]+)`},
 		{Pattern: `(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`},
 		{Pattern: `\b[0-9](?:[ -]?[0-9]){12,18}\b`, ReplaceFunc: redactCardNumber},
 	}
@@ -164,10 +198,12 @@ func (r sanitiserRule) text(value string) string {
 // Sanitisers run in the supplied order, each receiving the preceding output.
 // Nil and empty sanitisers are ignored; no active sanitisers returns inner unchanged.
 //
-// Wrap this handler inside [NewHandler] to ensure level filters see original values. Attributes already
-// bound to inner, context contents, and metadata added by inner are not scanned.
-// Opaque Any values (maps, structs, errors, etc.) are not traversed: redact them
-// by key or expose their fields as slog groups or LogValuer values.
+// Wrap this handler inside [NewHandler] to ensure filters see original values.
+// Attributes already bound to inner, context contents and metadata added by inner
+// are not scanned. By default, opaque Any values are not traversed: redact them
+// by key, expose slog groups, or explicitly enable SanitiserConfig.SanitiseObjects.
+// Attribute/group names are scanned only with SanitiserConfig.SanitiseKeys.
+// Whole-field rules matching an enclosing WithGroup name redact its attributes.
 // Nested groups are traversed and LogValuer values are resolved before text rules
 // run. Whole-field replacement avoids resolving the value being redacted.
 func NewSanitisingHandler(inner slog.Handler, sanitisers ...*Sanitiser) slog.Handler {
@@ -175,7 +211,7 @@ func NewSanitisingHandler(inner slog.Handler, sanitisers ...*Sanitiser) slog.Han
 	// including attributes bound via WithAttrs.
 	for i := len(sanitisers) - 1; i >= 0; i-- {
 		s := sanitisers[i]
-		if s != nil && len(s.rules) != 0 {
+		if s != nil && (len(s.rules) != 0 || s.sanitiseObjects) {
 			inner = &sanitisingHandler{inner: inner, sanitiser: s}
 		}
 	}
@@ -185,6 +221,7 @@ func NewSanitisingHandler(inner slog.Handler, sanitisers ...*Sanitiser) slog.Han
 type sanitisingHandler struct {
 	inner     slog.Handler
 	sanitiser *Sanitiser
+	groups    []string
 }
 
 func (h *sanitisingHandler) Enabled(ctx context.Context, level slog.Level) bool {
@@ -192,16 +229,11 @@ func (h *sanitisingHandler) Enabled(ctx context.Context, level slog.Level) bool 
 }
 
 func (h *sanitisingHandler) Handle(ctx context.Context, r slog.Record) error {
-	msg := r.Message
-	for _, rule := range h.sanitiser.rules {
-		if rule.key == nil {
-			msg = rule.text(msg)
-		}
-	}
+	msg := h.sanitiser.SanitiseText(r.Message)
 	var attrs []slog.Attr
 	index := 0
 	r.Attrs(func(a slog.Attr) bool {
-		clean, changed := h.sanitiser.attrChanged(a)
+		clean, changed := h.sanitiser.attrInGroups(h.groups, a)
 		if changed && attrs == nil {
 			attrs = make([]slog.Attr, 0, r.NumAttrs())
 			// Preserve the unchanged prefix without copying any attribute storage
@@ -232,13 +264,72 @@ func (h *sanitisingHandler) Handle(ctx context.Context, r slog.Record) error {
 func (h *sanitisingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	out := make([]slog.Attr, len(attrs))
 	for i, a := range attrs {
-		out[i] = h.sanitiser.attr(a)
+		out[i] = h.sanitiser.SanitiseAttr(h.groups, a)
 	}
-	return &sanitisingHandler{inner: h.inner.WithAttrs(out), sanitiser: h.sanitiser}
+	return &sanitisingHandler{inner: h.inner.WithAttrs(out), sanitiser: h.sanitiser, groups: h.groups}
 }
 
 func (h *sanitisingHandler) WithGroup(name string) slog.Handler {
-	return &sanitisingHandler{inner: h.inner.WithGroup(name), sanitiser: h.sanitiser}
+	if name == "" {
+		return h
+	}
+	groups := append(append([]string(nil), h.groups...), name)
+	outputName := name
+	if h.sanitiser.sanitiseKeys {
+		outputName = h.sanitiser.SanitiseText(name)
+	}
+	return &sanitisingHandler{inner: h.inner.WithGroup(outputName), sanitiser: h.sanitiser, groups: groups}
+}
+
+// SanitiseText applies unrestricted text rules in order. Key-specific rules are
+// ignored. A nil sanitiser leaves the input unchanged.
+func (s *Sanitiser) SanitiseText(value string) string {
+	if s == nil {
+		return value
+	}
+	for _, rule := range s.rules {
+		if rule.key == nil {
+			value = rule.text(value)
+		}
+	}
+	return value
+}
+
+// SanitiseAttr applies rules to an attribute without modifying its input.
+// Groups contains the enclosing group names. A whole-field rule matching an
+// enclosing name redacts the attribute before resolving its value.
+// A nil sanitiser leaves the attribute unchanged.
+func (s *Sanitiser) SanitiseAttr(groups []string, a slog.Attr) slog.Attr {
+	if s == nil || (len(s.rules) == 0 && !s.sanitiseObjects) {
+		return a
+	}
+	clean, _ := s.attrInGroups(groups, a)
+	return clean
+}
+
+func (s *Sanitiser) fieldReplacement(key string) (string, bool) {
+	for _, rule := range s.rules {
+		if rule.value == nil && rule.replaceFunc == nil && rule.key.MatchString(key) {
+			return rule.replacement, true
+		}
+	}
+	return "", false
+}
+
+func (s *Sanitiser) attrInGroups(groups []string, a slog.Attr) (slog.Attr, bool) {
+	if a.Equal(slog.Attr{}) {
+		return a, false
+	}
+	for _, group := range groups {
+		if replacement, ok := s.fieldReplacement(group); ok {
+			key := a.Key
+			if s.sanitiseKeys {
+				key = s.SanitiseText(key)
+			}
+			return slog.String(key, replacement), true
+		}
+	}
+	return s.attrChanged(a)
 }
 
 func (s *Sanitiser) attr(a slog.Attr) slog.Attr {
@@ -251,13 +342,15 @@ func (s *Sanitiser) attrChanged(a slog.Attr) (slog.Attr, bool) {
 	if a.Equal(slog.Attr{}) {
 		return a, false
 	}
-	// Whole-field redaction avoids evaluating sensitive LogValuer values.
-	for _, rule := range s.rules {
-		if rule.value == nil && rule.replaceFunc == nil && rule.key.MatchString(a.Key) {
-			return slog.String(a.Key, rule.replacement), true
-		}
+	key := a.Key
+	if s.sanitiseKeys {
+		a.Key = s.SanitiseText(key)
 	}
-	changed := a.Value.Kind() == slog.KindLogValuer
+	// Whole-field redaction avoids evaluating sensitive LogValuer values.
+	if replacement, ok := s.fieldReplacement(key); ok {
+		return slog.String(a.Key, replacement), true
+	}
+	changed := a.Key != key || a.Value.Kind() == slog.KindLogValuer
 	a.Value = a.Value.Resolve()
 	switch a.Value.Kind() {
 	case slog.KindGroup:
@@ -277,10 +370,15 @@ func (s *Sanitiser) attrChanged(a slog.Attr) (slog.Attr, bool) {
 			a.Value = slog.GroupValue(out...)
 			changed = true
 		}
+	case slog.KindAny:
+		if s.sanitiseObjects && a.Value.Any() != nil {
+			a.Value = slog.AnyValue(s.safeAny(a.Value.Any(), key))
+			changed = true
+		}
 	case slog.KindString:
 		value := a.Value.String()
 		for _, rule := range s.rules {
-			if (rule.value != nil || rule.replaceFunc != nil) && (rule.key == nil || rule.key.MatchString(a.Key)) {
+			if (rule.value != nil || rule.replaceFunc != nil) && (rule.key == nil || rule.key.MatchString(key)) {
 				value = rule.text(value)
 			}
 		}

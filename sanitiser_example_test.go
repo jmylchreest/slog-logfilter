@@ -3,6 +3,7 @@ package logfilter_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -92,4 +93,42 @@ func ExampleWithSanitisers() {
 	fmt.Println(record.Username, record.Password)
 	// Output:
 	// [PERSON] [SECRET]
+}
+
+func ExampleNewSanitiserWithConfig() {
+	s, err := logfilter.NewSanitiserWithConfig(logfilter.SanitiserConfig{
+		Rules:           logfilter.DefaultSanitiserRules(),
+		SanitiseObjects: true,
+	})
+	if err != nil {
+		panic(err)
+	}
+	input := struct {
+		Password string
+		Count    int
+	}{"secret", 2}
+	clean := s.SanitiseAttr(nil, slog.Any("payload", input))
+	encoded, err := json.Marshal(clean.Value.Any())
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(encoded))
+	fmt.Println(input.Password)
+	// Output:
+	// {"Count":2,"Password":"[REDACTED]"}
+	// secret
+}
+
+func ExampleSanitiseError() {
+	s, err := logfilter.NewSanitiser(logfilter.DefaultSanitiserRules()...)
+	if err != nil {
+		panic(err)
+	}
+	original := errors.New("request failed: api_key=secret")
+	clean := logfilter.SanitiseError(original, s)
+	fmt.Println(clean)
+	fmt.Println(errors.Is(clean, original))
+	// Output:
+	// request failed: [REDACTED]
+	// true
 }
