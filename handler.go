@@ -12,19 +12,27 @@ import (
 
 // Handler is an slog.Handler that supports dynamic log levels and filter-based
 // level overrides. It wraps an inner handler and checks filters before delegating.
+// Derived handlers share the same LevelVar and context extractor registry, but
+// capture independent filter snapshots. Updating filters on a parent does not
+// update existing children; configure filters before deriving loggers, or update
+// the specific child's Handler. This preserves the behaviour of earlier releases.
 type Handler struct {
 	inner             slog.Handler
 	globalLevel       *slog.LevelVar
 	filters           []LogFilter
 	filtersLock       sync.RWMutex
-	lowestLevel       atomic.Int64 // Cached lowest level from active filters (stored as int64)
-	hasSourceFilters  bool         // Cached: true if any filter is source-based
-	preformattedAttrs []slog.Attr  // Attributes added via WithAttrs
-	workDir           string       // Working directory for relative path calculation
+	lowestLevel       atomic.Int64                // Cached lowest level from active filters (stored as int64)
+	hasSourceFilters  bool                        // Cached: true if any filter is source-based
+	preformattedAttrs []slog.Attr                 // Attributes added via WithAttrs
+	workDir           string                      // Working directory for relative path calculation
+	extractors        map[string]ContextExtractor // Immutable local registry; nil uses global registry
 }
 
 // NewHandler creates a new filter-aware handler wrapping the given inner handler.
 // The globalLevel is used as the default log level when no filters match.
+// The supplied LevelVar must be non-nil and is not registered globally. Context
+// filters use the package registry; use NewIsolated with WithContextExtractors
+// for a fully local registry.
 func NewHandler(inner slog.Handler, globalLevel *slog.LevelVar) *Handler {
 	wd := ""
 	if cwd, err := filepath.Abs("."); err == nil {
@@ -39,8 +47,17 @@ func NewHandler(inner slog.Handler, globalLevel *slog.LevelVar) *Handler {
 	return h
 }
 
+// SetLevel changes this handler's default level and that of its derived handlers.
+// For handlers created by New, this is the package's shared level. Handlers
+// created by NewIsolated have an independent level.
+func (h *Handler) SetLevel(level slog.Level) { h.globalLevel.Set(level) }
+
+// GetLevel returns this handler's current default level.
+func (h *Handler) GetLevel() slog.Level { return h.globalLevel.Level() }
+
 // SetFilters replaces all filters with the given list.
 // Filters are applied in order; first match wins.
+// Existing derived handlers retain their own filter snapshots.
 func (h *Handler) SetFilters(filters []LogFilter) {
 	h.filtersLock.Lock()
 	defer h.filtersLock.Unlock()
@@ -180,7 +197,11 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 			found = sourceFunction != ""
 		case filterKindContext:
 			// Extract from context
-			value, found = extractFromContext(ctx, f.contextKey)
+			if h.extractors == nil {
+				value, found = extractFromContext(ctx, f.contextKey)
+			} else if extractor := h.extractors[f.contextKey]; ctx != nil && extractor != nil {
+				value, found = extractor(ctx)
+			}
 		default:
 			// Build the attribute map on first need
 			if attrs == nil {
@@ -300,6 +321,7 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		hasSourceFilters:  h.hasSourceFilters,
 		preformattedAttrs: merged,
 		workDir:           h.workDir,
+		extractors:        h.extractors,
 	}
 	newHandler.lowestLevel.Store(h.lowestLevel.Load())
 	return newHandler
@@ -317,6 +339,7 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 		hasSourceFilters:  h.hasSourceFilters,
 		preformattedAttrs: h.preformattedAttrs,
 		workDir:           h.workDir,
+		extractors:        h.extractors,
 	}
 	newHandler.lowestLevel.Store(h.lowestLevel.Load())
 	return newHandler

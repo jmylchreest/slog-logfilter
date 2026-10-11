@@ -40,6 +40,17 @@
 //	    Type: "context:user_id", Pattern: "user_123", Level: "debug", Enabled: true,
 //	})
 //
+// # Independent instances
+//
+// Libraries and applications with multiple independent logging configurations
+// should use [NewIsolated]. It owns its level, filter configuration and context
+// extractor registry. [New] retains the package-global behaviour for compatibility;
+// [SetDefault] additionally installs the logger as slog.Default.
+//
+// Derived handlers share levels, but capture filter snapshots. Configure filters
+// before calling With or WithGroup, or update the derived [Handler] directly.
+// See [WithContextExtractors] for instance-local context filtering.
+//
 // # Sanitisation
 //
 // Sanitisation is disabled by default. Construct rules with [NewSanitiser] and
@@ -84,6 +95,7 @@ type options struct {
 	workDir    string
 	filters    []LogFilter
 	sanitisers []*Sanitiser
+	extractors map[string]ContextExtractor
 }
 
 // WithLevel sets the initial log level.
@@ -121,6 +133,18 @@ func WithFilters(filters []LogFilter) Option {
 	}
 }
 
+// WithContextExtractors sets a logger-local context extractor registry. The map
+// is copied; later map changes and package-level registrations have no effect.
+// Nil selects an empty registry. Callbacks must be safe for concurrent use.
+// Without this option, New uses the global registry and NewIsolated uses none.
+func WithContextExtractors(extractors map[string]ContextExtractor) Option {
+	snapshot := make(map[string]ContextExtractor, len(extractors))
+	for key, extractor := range extractors {
+		snapshot[key] = extractor
+	}
+	return func(o *options) { o.extractors = snapshot }
+}
+
 // WithSanitiser enables optional output sanitisation. A nil sanitiser disables it.
 // Filters still match the original, unsanitised values.
 func WithSanitiser(s *Sanitiser) Option {
@@ -136,15 +160,38 @@ func WithSanitisers(sanitisers ...*Sanitiser) Option {
 	return func(o *options) { o.sanitisers = snapshot }
 }
 
-// New creates a new slog.Logger with filter support.
-// The returned logger uses the global filter handler, so filters can be
-// updated at runtime using SetFilters, AddFilter, etc.
+// New creates a logger using the package's shared level and registers its handler
+// for package-level filter setters. Calling New changes the level of all loggers
+// previously created by New; filter setters target only the most recent handler.
+// It does not call slog.SetDefault. Use [NewIsolated] for independent instances.
 func New(opts ...Option) *slog.Logger {
+	handler := newConfiguredHandler(defaultLevel, false, opts...)
+	defaultHandlerLock.Lock()
+	defaultHandler = handler
+	defaultHandlerLock.Unlock()
+	return slog.New(handler)
+}
+
+// NewIsolated creates a logger with its own level, filters and context extractor
+// registry. It does not read or change the package's global configuration or
+// slog.Default. Options have the same defaults as New, except that context
+// extractors are empty unless supplied with [WithContextExtractors].
+//
+// Use logger.Handler().(*Handler) to change this instance's level and filters.
+// Derived loggers share the level but retain filter snapshots; see [Handler].
+func NewIsolated(opts ...Option) *slog.Logger {
+	return slog.New(newConfiguredHandler(new(slog.LevelVar), true, opts...))
+}
+
+func newConfiguredHandler(level *slog.LevelVar, isolated bool, opts ...Option) *Handler {
 	o := &options{
 		level:  slog.LevelInfo,
 		format: "json",
 		output: os.Stdout,
 		source: true,
+	}
+	if isolated {
+		o.extractors = make(map[string]ContextExtractor)
 	}
 	o.workDir, _ = os.Getwd()
 
@@ -152,12 +199,12 @@ func New(opts ...Option) *slog.Logger {
 		opt(o)
 	}
 
-	defaultLevel.Set(o.level)
+	level.Set(o.level)
 
 	trimPrefix := detectSourcePrefix()
 
 	handlerOpts := &slog.HandlerOptions{
-		Level:     defaultLevel,
+		Level:     level,
 		AddSource: o.source,
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.SourceKey {
@@ -177,18 +224,15 @@ func New(opts ...Option) *slog.Logger {
 	}
 
 	inner = NewSanitisingHandler(inner, o.sanitisers...)
-	handler := NewHandler(inner, defaultLevel)
+	handler := NewHandler(inner, level)
+	handler.extractors = o.extractors
 
 	// Apply initial filters if provided
 	if len(o.filters) > 0 {
 		handler.SetFilters(o.filters)
 	}
 
-	defaultHandlerLock.Lock()
-	defaultHandler = handler
-	defaultHandlerLock.Unlock()
-
-	return slog.New(handler)
+	return handler
 }
 
 // SetLevel changes the global log level at runtime.
