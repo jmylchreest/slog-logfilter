@@ -80,6 +80,9 @@ another logger never resets an existing logger's configuration. `NewHandler`
 owns its filters and extractors; passing the same `*slog.LevelVar` to multiple
 handlers explicitly shares only their level.
 
+`WithFilters` snapshots its slice and expiry values when the option is created;
+later input changes do not affect loggers built with that option.
+
 `Handler.SetLevel`/`GetLevel`, filter methods and context extractor methods operate
 on that handler's logger family. `WithContextExtractors` copies its map for each
 constructed logger, even when an option is reused. Callbacks must be safe for

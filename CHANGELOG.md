@@ -39,7 +39,8 @@ Applications must migrate as described below.
 
 - Filter updates no longer race with logging or handler derivation.
 - Filter expiry values are copied on configuration input and output, preventing
-  indirect changes through caller-owned pointers.
+  indirect changes through caller-owned pointers. `WithFilters` snapshots its
+  input when the option is created, including expiry values.
 - Output-level transformation avoids copying record attributes.
 - Sanitisation reuses unchanged strings, groups and record attribute storage.
   Matching-heavy workloads allocate less but may do extra regex work; benchmarks

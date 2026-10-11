@@ -118,10 +118,16 @@ func WithSource(enabled bool) Option {
 	}
 }
 
-// WithFilters sets the initial filters.
+// WithFilters sets the initial filters. The slice and expiry values are copied
+// when the option is created; later changes to the input have no effect.
+// The option can be reused to construct independent loggers.
 func WithFilters(filters []LogFilter) Option {
+	snapshot := make([]LogFilter, len(filters))
+	for i, filter := range filters {
+		snapshot[i] = copyFilter(filter)
+	}
 	return func(o *options) {
-		o.filters = filters
+		o.filters = snapshot
 	}
 }
 

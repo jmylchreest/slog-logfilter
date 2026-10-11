@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNewDoesNotChangeExistingLoggers(t *testing.T) {
@@ -149,5 +150,21 @@ func TestNewHandlerSharesOnlySuppliedLevel(t *testing.T) {
 	a.RegisterContextExtractor("id", func(context.Context) (string, bool) { return "a", true })
 	if b.GetLevel() != slog.LevelWarn || len(b.GetFilters()) != 0 || b.GetContextExtractor("id") != nil {
 		t.Fatal("NewHandler must share only the explicitly supplied level")
+	}
+}
+
+func TestWithFiltersSnapshotsInputAndSupportsReuse(t *testing.T) {
+	expiry := time.Now().Add(time.Hour)
+	wantExpiry := expiry
+	filters := []LogFilter{{Type: "id", Pattern: "original", Level: "debug", Enabled: true, ExpiresAt: &expiry}}
+	option := WithFilters(filters)
+	filters[0].Pattern = "mutated"
+	expiry = time.Time{}
+	a := New(WithOutput(io.Discard), option).Handler().(*Handler)
+	a.ClearFilters()
+	b := New(WithOutput(io.Discard), option).Handler().(*Handler)
+	got := b.GetFilters()
+	if len(got) != 1 || got[0].Pattern != "original" || got[0].ExpiresAt == nil || !got[0].ExpiresAt.Equal(wantExpiry) {
+		t.Fatalf("option did not preserve its original configuration: %+v", got)
 	}
 }
