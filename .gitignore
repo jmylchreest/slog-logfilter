@@ -1,0 +1,3 @@
+# Only AIDE's shared exports belong in version control.
+/.aide/*
+!/.aide/shared/
