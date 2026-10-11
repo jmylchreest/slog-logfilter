@@ -16,6 +16,8 @@ A dynamic, filter-based logging library for Go's `log/slog`. Enables runtime log
 
 ## Installation
 
+Requires Go 1.22 or later. The library has no external runtime dependencies.
+
 ```bash
 go get github.com/jmylchreest/slog-logfilter
 ```
@@ -48,6 +50,52 @@ func main() {
     logger.Info("status", "job_id", "normal_456")      // Emitted (INFO >= global)
 }
 ```
+
+## Independent Loggers and Runtime Updates
+
+Use `NewIsolated` when embedding this library in another library or creating
+multiple independent loggers. It does not change package globals or `slog.Default`:
+
+```go
+logger := logfilter.NewIsolated(
+    logfilter.WithOutput(output),
+    logfilter.WithLevel(slog.LevelWarn),
+    logfilter.WithContextExtractors(map[string]logfilter.ContextExtractor{
+        "tenant": func(ctx context.Context) (string, bool) {
+            tenant, ok := ctx.Value(tenantKey).(string)
+            return tenant, ok
+        },
+    }),
+)
+handler := logger.Handler().(*logfilter.Handler)
+handler.SetLevel(slog.LevelDebug)
+handler.SetFilters([]logfilter.LogFilter{
+    {Type: "context:tenant", Pattern: "noisy", Level: "error", Enabled: true},
+})
+```
+
+| Construction | Level ownership | Package-level filter setters | Context extractors |
+|--------------|-----------------|------------------------------|--------------------|
+| `New(...)` | Shared across all `New` loggers; each call resets it | Target the most recently created `New` handler | Global unless `WithContextExtractors` is supplied |
+| `NewIsolated(...)` | Independent for each call | Have no effect | Empty unless `WithContextExtractors` is supplied |
+| `NewHandler(inner, levelVar)` | Uses the caller's supplied `LevelVar` | Does not register the handler | Global |
+
+`SetDefault(...)` calls `New(...)` and also changes `slog.Default`. `New` and
+`NewIsolated` themselves do not install a default logger. Existing `New` behaviour
+is preserved; callers can migrate one logger at a time to `NewIsolated`.
+
+`Handler.SetLevel` and `Handler.GetLevel` access the level of that handler. Its
+`SetFilters`, `AddFilter`, `RemoveFilter` and `ClearFilters` methods operate on
+that handler's filters. The extractor map supplied to `WithContextExtractors`
+is copied; callbacks must be safe for concurrent use.
+
+**Derived loggers:** `With` and `WithGroup` share their parent's level and extractor
+registry, but capture the filters configured when they are created. Subsequent
+filter updates on the parent do not reach existing children, and updates on a
+child do not change its parent or siblings. Configure filters before creating
+children, recreate children after a filter change, or update their handlers
+explicitly. This snapshot behaviour is retained for backward compatibility.
+Sanitisers are immutable and inherited by derived loggers.
 
 ## Filter Configuration
 
@@ -345,6 +393,19 @@ logger := slog.New(handler)
 ```
 
 Attributes already bound directly to `inner` cannot be sanitised by the wrapper.
+
+### Sanitisation Compatibility
+
+Sanitisation remains opt-in. Changes to the default rule set can alter log output
+even when Go signatures remain compatible, so release notes describe changes to
+patterns, replacements, validation and coverage. For application-controlled
+redaction policies, supply your own explicit rules rather than relying on defaults.
+
+The library does not promise comprehensive personal-data or secret detection.
+Whole-field rules are appropriate for known sensitive attributes. Callback return
+values are final literal text, and callback panics propagate; callers own callback
+concurrency and error handling. See [CHANGELOG.md](CHANGELOG.md) for release-specific
+behaviour and [CONTRIBUTING.md](CONTRIBUTING.md) for compatibility checks.
 
 ## Runtime API
 
