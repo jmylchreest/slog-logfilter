@@ -10,60 +10,67 @@ import (
 	"sync/atomic"
 )
 
-// Handler is an slog.Handler that supports dynamic log levels and filter-based
-// level overrides. It wraps an inner handler and checks filters before delegating.
-// Derived handlers share the same LevelVar and context extractor registry, but
-// capture independent filter snapshots. Updating filters on a parent does not
-// update existing children; configure filters before deriving loggers, or update
-// the specific child's Handler. This preserves the behaviour of earlier releases.
+// Handler is an slog.Handler with runtime level and filter controls. Handlers
+// derived with WithAttrs or WithGroup share level, filters and context extractors
+// with their parent. Updates through any member reach the entire logger family.
+// Independently constructed handlers have separate configurations.
 type Handler struct {
+	*handlerState
 	inner             slog.Handler
-	globalLevel       *slog.LevelVar
-	filters           []LogFilter
-	filtersLock       sync.RWMutex
-	lowestLevel       atomic.Int64                // Cached lowest level from active filters (stored as int64)
-	hasSourceFilters  bool                        // Cached: true if any filter is source-based
-	preformattedAttrs []slog.Attr                 // Attributes added via WithAttrs
-	workDir           string                      // Working directory for relative path calculation
-	extractors        map[string]ContextExtractor // Immutable local registry; nil uses global registry
+	preformattedAttrs []slog.Attr
+	workDir           string
+}
+
+// handlerState is shared by a root handler and all derived handlers.
+// Filter slices are immutable once published; their replacement is locked.
+type handlerState struct {
+	level            *slog.LevelVar
+	filters          []LogFilter
+	filtersLock      sync.RWMutex
+	lowestLevel      atomic.Int64
+	hasSourceFilters bool
+	extractors       map[string]ContextExtractor
+	extractorsLock   sync.RWMutex
 }
 
 // NewHandler creates a new filter-aware handler wrapping the given inner handler.
-// The globalLevel is used as the default log level when no filters match.
-// The supplied LevelVar must be non-nil and is not registered globally. Context
-// filters use the package registry; use NewIsolated with WithContextExtractors
-// for a fully local registry.
-func NewHandler(inner slog.Handler, globalLevel *slog.LevelVar) *Handler {
+// The level is used as the default log level when no filters match.
+// The supplied LevelVar must be non-nil and is not registered globally. The
+// handler starts with an empty context extractor registry. Reusing a LevelVar
+// across independently constructed handlers shares only that level.
+func NewHandler(inner slog.Handler, level *slog.LevelVar) *Handler {
 	wd := ""
 	if cwd, err := filepath.Abs("."); err == nil {
 		wd = cwd
 	}
 	h := &Handler{
-		inner:       inner,
-		globalLevel: globalLevel,
-		workDir:     wd,
+		inner:        inner,
+		handlerState: &handlerState{level: level},
+		workDir:      wd,
 	}
 	h.lowestLevel.Store(int64(slog.LevelError + 1)) // Higher than any valid level
 	return h
 }
 
 // SetLevel changes this handler's default level and that of its derived handlers.
-// For handlers created by New, this is the package's shared level. Handlers
-// created by NewIsolated have an independent level.
-func (h *Handler) SetLevel(level slog.Level) { h.globalLevel.Set(level) }
+// Independently constructed loggers are unaffected unless they explicitly use
+// the same LevelVar via NewHandler.
+func (h *Handler) SetLevel(level slog.Level) { h.level.Set(level) }
 
 // GetLevel returns this handler's current default level.
-func (h *Handler) GetLevel() slog.Level { return h.globalLevel.Level() }
+func (h *Handler) GetLevel() slog.Level { return h.level.Level() }
 
 // SetFilters replaces all filters with the given list.
 // Filters are applied in order; first match wins.
-// Existing derived handlers retain their own filter snapshots.
+// The new filters apply to all existing derived handlers.
 func (h *Handler) SetFilters(filters []LogFilter) {
 	h.filtersLock.Lock()
 	defer h.filtersLock.Unlock()
 
 	h.filters = make([]LogFilter, len(filters))
-	copy(h.filters, filters)
+	for i, filter := range filters {
+		h.filters[i] = copyFilter(filter)
+	}
 	h.updateLowestLevel()
 }
 
@@ -73,7 +80,9 @@ func (h *Handler) GetFilters() []LogFilter {
 	defer h.filtersLock.RUnlock()
 
 	filters := make([]LogFilter, len(h.filters))
-	copy(filters, h.filters)
+	for i, filter := range h.filters {
+		filters[i] = copyFilter(filter)
+	}
 	return filters
 }
 
@@ -86,9 +95,19 @@ func (h *Handler) AddFilter(filter LogFilter) {
 	// belong to derived handlers. Never re-prepare their cached fields in place.
 	filters := make([]LogFilter, len(h.filters)+1)
 	copy(filters, h.filters)
-	filters[len(h.filters)] = filter
+	filters[len(h.filters)] = copyFilter(filter)
 	h.filters = filters
 	h.updateLowestLevel()
+}
+
+// copyFilter owns the expiry value so input/output config cannot mutate a live
+// logger family indirectly through ExpiresAt pointers.
+func copyFilter(filter LogFilter) LogFilter {
+	if filter.ExpiresAt != nil {
+		expiry := *filter.ExpiresAt
+		filter.ExpiresAt = &expiry
+	}
+	return filter
 }
 
 // RemoveFilter removes filters matching the given type and pattern.
@@ -141,11 +160,11 @@ func (h *Handler) updateLowestLevel() {
 
 // Enabled reports whether the handler handles records at the given level.
 // It returns true if either:
-// - The level is >= the global level, OR
+// - The level is >= the handler default, OR
 // - There are active filters that might match at this level
 func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
-	// Fast path: level is at or above global level
-	if level >= h.globalLevel.Level() {
+	// Fast path: level is at or above the handler default
+	if level >= h.level.Level() {
 		return true
 	}
 
@@ -159,7 +178,7 @@ func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
 // Handle processes a log record, applying filters to determine the effective level.
 // If a matching filter has OutputLevel set, the record's level is transformed before emission.
 func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
-	effectiveLevel := h.globalLevel.Level()
+	effectiveLevel := h.level.Level()
 	var matchedFilter *LogFilter
 
 	// Check filters (first match wins)
@@ -197,11 +216,7 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 			found = sourceFunction != ""
 		case filterKindContext:
 			// Extract from context
-			if h.extractors == nil {
-				value, found = extractFromContext(ctx, f.contextKey)
-			} else if extractor := h.extractors[f.contextKey]; ctx != nil && extractor != nil {
-				value, found = extractor(ctx)
-			}
+			value, found = h.extractFromContext(ctx, f.contextKey)
 		default:
 			// Build the attribute map on first need
 			if attrs == nil {
@@ -304,45 +319,28 @@ func (h *Handler) formatSourcePath(filePath, functionName string) string {
 	return filepath.Base(filePath)
 }
 
-// WithAttrs returns a new Handler with the given attributes added.
+// WithAttrs returns a derived handler sharing its parent's runtime configuration.
 func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	// Copy preformattedAttrs to avoid aliasing the parent's backing array.
 	merged := make([]slog.Attr, len(h.preformattedAttrs), len(h.preformattedAttrs)+len(attrs))
 	copy(merged, h.preformattedAttrs)
 	merged = append(merged, attrs...)
-	inner := h.inner.WithAttrs(attrs)
-	h.filtersLock.RLock()
-	defer h.filtersLock.RUnlock()
-
-	newHandler := &Handler{
-		inner:             inner,
-		globalLevel:       h.globalLevel,
-		filters:           h.filters,
-		hasSourceFilters:  h.hasSourceFilters,
+	return &Handler{
+		inner:             h.inner.WithAttrs(attrs),
+		handlerState:      h.handlerState,
 		preformattedAttrs: merged,
 		workDir:           h.workDir,
-		extractors:        h.extractors,
 	}
-	newHandler.lowestLevel.Store(h.lowestLevel.Load())
-	return newHandler
 }
 
-// WithGroup returns a new Handler with the given group name.
+// WithGroup returns a derived handler sharing its parent's runtime configuration.
 func (h *Handler) WithGroup(name string) slog.Handler {
-	inner := h.inner.WithGroup(name)
-	h.filtersLock.RLock()
-	defer h.filtersLock.RUnlock()
-	newHandler := &Handler{
-		inner:             inner,
-		globalLevel:       h.globalLevel,
-		filters:           h.filters,
-		hasSourceFilters:  h.hasSourceFilters,
+	return &Handler{
+		inner:             h.inner.WithGroup(name),
+		handlerState:      h.handlerState,
 		preformattedAttrs: h.preformattedAttrs,
 		workDir:           h.workDir,
-		extractors:        h.extractors,
 	}
-	newHandler.lowestLevel.Store(h.lowestLevel.Load())
-	return newHandler
 }
 
 // attrValueToString converts an slog.Value to a string for pattern matching.

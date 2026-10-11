@@ -9,9 +9,9 @@ import (
 	"github.com/jmylchreest/slog-logfilter"
 )
 
-func ExampleNewIsolated() {
+func ExampleNew() {
 	var output bytes.Buffer
-	logger := logfilter.NewIsolated(
+	logger := logfilter.New(
 		logfilter.WithOutput(&output),
 		logfilter.WithLevel(slog.LevelWarn),
 	)
@@ -31,7 +31,7 @@ func ExampleNewIsolated() {
 func ExampleWithContextExtractors() {
 	type tenantKey struct{}
 	var output bytes.Buffer
-	logger := logfilter.NewIsolated(
+	logger := logfilter.New(
 		logfilter.WithOutput(&output),
 		logfilter.WithContextExtractors(map[string]logfilter.ContextExtractor{
 			"tenant": func(ctx context.Context) (string, bool) {
@@ -47,4 +47,25 @@ func ExampleWithContextExtractors() {
 	logger.DebugContext(ctx, "tenant-specific diagnostics")
 	fmt.Println(output.Len() > 0)
 	// Output: true
+}
+
+func ExampleNew_default() {
+	previous := slog.Default()
+	defer slog.SetDefault(previous)
+	var output bytes.Buffer
+	logger := logfilter.New(logfilter.WithOutput(&output))
+	slog.SetDefault(logger)
+	child := logger.With("component", "worker")
+	handler := logger.Handler().(*logfilter.Handler)
+	handler.SetFilters([]logfilter.LogFilter{
+		{Type: "component", Pattern: "worker", Level: "debug", Enabled: true},
+	})
+	child.Debug("worker diagnostics")
+	fmt.Println(output.Len() > 0)
+	output.Reset()
+	slog.Info("application message")
+	fmt.Println(output.Len() > 0)
+	// Output:
+	// true
+	// true
 }

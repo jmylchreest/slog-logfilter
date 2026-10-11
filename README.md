@@ -4,7 +4,7 @@ A dynamic, filter-based logging library for Go's `log/slog`. Enables runtime log
 
 ## Features
 
-- **Dynamic log levels** - Change global log level at runtime via `LevelVar`
+- **Dynamic log levels** - Change each logger family's level at runtime via `LevelVar`
 - **Filter-based overrides** - Elevate or suppress logs based on attribute values
 - **Context extraction** - Filter on values stored in `context.Context`
 - **Source-based filtering** - Filter by file path or function name (Rust-style module filtering)
@@ -40,24 +40,24 @@ func main() {
     )
 
     // Add filters at runtime
-    logfilter.SetFilters([]logfilter.LogFilter{
+    handler := logger.Handler().(*logfilter.Handler)
+    handler.SetFilters([]logfilter.LogFilter{
         {Type: "job_id", Pattern: "debug_*", Level: "debug", Enabled: true},
     })
 
     // Logs with matching attributes use filter's level
     logger.Debug("processing", "job_id", "debug_123") // Emitted (filter matches)
     logger.Debug("processing", "job_id", "normal_456") // Suppressed (no match)
-    logger.Info("status", "job_id", "normal_456")      // Emitted (INFO >= global)
+    logger.Info("status", "job_id", "normal_456")      // Emitted (INFO >= base)
 }
 ```
 
 ## Independent Loggers and Runtime Updates
 
-Use `NewIsolated` when embedding this library in another library or creating
-multiple independent loggers. It does not change package globals or `slog.Default`:
+Use `New` for independent loggers. It does not change `slog.Default`:
 
 ```go
-logger := logfilter.NewIsolated(
+logger := logfilter.New(
     logfilter.WithOutput(output),
     logfilter.WithLevel(slog.LevelWarn),
     logfilter.WithContextExtractors(map[string]logfilter.ContextExtractor{
@@ -74,28 +74,53 @@ handler.SetFilters([]logfilter.LogFilter{
 })
 ```
 
-| Construction | Level ownership | Package-level filter setters | Context extractors |
-|--------------|-----------------|------------------------------|--------------------|
-| `New(...)` | Shared across all `New` loggers; each call resets it | Target the most recently created `New` handler | Global unless `WithContextExtractors` is supplied |
-| `NewIsolated(...)` | Independent for each call | Have no effect | Empty unless `WithContextExtractors` is supplied |
-| `NewHandler(inner, levelVar)` | Uses the caller's supplied `LevelVar` | Does not register the handler | Global |
+Every constructor starts with an empty context registry unless configured with
+`WithContextExtractors` (for `NewHandler`, use its registration methods). Creating
+another logger never resets an existing logger's configuration. `NewHandler`
+owns its filters and extractors; passing the same `*slog.LevelVar` to multiple
+handlers explicitly shares only their level.
 
-`SetDefault(...)` calls `New(...)` and also changes `slog.Default`. `New` and
-`NewIsolated` themselves do not install a default logger. Existing `New` behaviour
-is preserved; callers can migrate one logger at a time to `NewIsolated`.
+`Handler.SetLevel`/`GetLevel`, filter methods and context extractor methods operate
+on that handler's logger family. `WithContextExtractors` copies its map for each
+constructed logger, even when an option is reused. Callbacks must be safe for
+concurrent use. `Handler.RegisterContextExtractor`, `UnregisterContextExtractor`
+and `ClearContextExtractors` update the registry at runtime.
 
-`Handler.SetLevel` and `Handler.GetLevel` access the level of that handler. Its
-`SetFilters`, `AddFilter`, `RemoveFilter` and `ClearFilters` methods operate on
-that handler's filters. The extractor map supplied to `WithContextExtractors`
-is copied; callbacks must be safe for concurrent use.
+**Derived loggers:** `With` and `WithGroup` share levels, filters and context
+extractors with their parent. Updates through a parent, child or sibling reach
+all existing members of the same family. Independently constructed loggers remain
+unaffected. Sanitisers are immutable and inherited by derived loggers; output,
+bound attributes and groups retain their normal slog handler semantics.
 
-**Derived loggers:** `With` and `WithGroup` share their parent's level and extractor
-registry, but capture the filters configured when they are created. Subsequent
-filter updates on the parent do not reach existing children, and updates on a
-child do not change its parent or siblings. Configure filters before creating
-children, recreate children after a filter change, or update their handlers
-explicitly. This snapshot behaviour is retained for backward compatibility.
-Sanitisers are immutable and inherited by derived loggers.
+**Application default:** the package has no global registry. Applications that
+want a process-wide default use the standard library:
+
+```go
+slog.SetDefault(logger)
+slog.Info("uses the application logger")
+```
+
+Keep the handler reference for runtime updates. Replacing `slog.Default` does
+not change previously created loggers or their configuration.
+
+### Migrating from v0.2.x
+
+Version 0.3.0 intentionally breaks the package-level configuration API:
+
+- Keep `New(...)` and obtain `handler := logger.Handler().(*logfilter.Handler)`.
+  Replace package-level level and filter functions with the same methods on
+  `handler`, for example `logfilter.SetLevel(level)` becomes
+  `handler.SetLevel(level)`. This also applies to getters.
+- Replace `logfilter.GetHandler()` with the handler reference above.
+- Replace `logfilter.SetDefault(options...)` with
+  `logger := logfilter.New(options...)`, then `slog.SetDefault(logger)`.
+- Move all context extractor registration, lookup and removal calls onto the
+  handler, or supply initial extractors with `WithContextExtractors`.
+  `NewHandler` also starts with an empty context registry.
+- Filter changes now reach existing children. Construct separate loggers with
+  explicit configuration if you previously relied on child filter snapshots.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full release notes.
 
 ## Filter Configuration
 
@@ -164,8 +189,11 @@ type LogFilter struct {
 Filter on values stored in context (useful for request-scoped data):
 
 ```go
+logger := logfilter.New()
+handler := logger.Handler().(*logfilter.Handler)
+
 // Register a context extractor
-logfilter.RegisterContextExtractor("user_id", func(ctx context.Context) (string, bool) {
+handler.RegisterContextExtractor("user_id", func(ctx context.Context) (string, bool) {
     if v := ctx.Value(UserIDKey); v != nil {
         if s, ok := v.(string); ok {
             return s, true
@@ -175,7 +203,7 @@ logfilter.RegisterContextExtractor("user_id", func(ctx context.Context) (string,
 })
 
 // Use "context:" prefix in filter type
-logfilter.AddFilter(logfilter.LogFilter{
+handler.AddFilter(logfilter.LogFilter{
     Type:    "context:user_id",
     Pattern: "debug_user_*",
     Level:   "debug",
@@ -189,11 +217,13 @@ logger.DebugContext(ctx, "user action") // Emitted (context matches)
 
 ## Source-Based Filtering
 
+Use the handler obtained from `logger.Handler().(*logfilter.Handler)`:
+
 Filter logs based on where they originate in your code (similar to Rust's `RUST_LOG` module filtering):
 
 ```go
 // Enable debug logging for all files in the service package
-logfilter.AddFilter(logfilter.LogFilter{
+handler.AddFilter(logfilter.LogFilter{
     Type:    "source:file",
     Pattern: "internal/service/*",
     Level:   "debug",
@@ -201,7 +231,7 @@ logfilter.AddFilter(logfilter.LogFilter{
 })
 
 // Enable debug logging for all Extraction-related functions
-logfilter.AddFilter(logfilter.LogFilter{
+handler.AddFilter(logfilter.LogFilter{
     Type:    "source:function",
     Pattern: "*Extraction*",
     Level:   "debug",
@@ -409,40 +439,44 @@ behaviour and [CONTRIBUTING.md](CONTRIBUTING.md) for compatibility checks.
 
 ## Runtime API
 
+These methods update the logger and its derived loggers:
+
 ```go
-// Change global level
-logfilter.SetLevel(slog.LevelDebug)
-level := logfilter.GetLevel()
+handler := logger.Handler().(*logfilter.Handler)
+
+// Change the logger family level
+handler.SetLevel(slog.LevelDebug)
+level := handler.GetLevel()
 
 // Manage filters
-logfilter.SetFilters(filters)           // Replace all filters
-logfilter.AddFilter(filter)             // Add single filter
-logfilter.RemoveFilter("job_id", "abc*") // Remove by type+pattern
-logfilter.ClearFilters()                // Remove all filters
-filters := logfilter.GetFilters()       // Get current filters
+handler.SetFilters(filters)           // Replace all filters
+handler.AddFilter(filter)             // Add single filter
+handler.RemoveFilter("job_id", "abc*") // Remove by type+pattern
+handler.ClearFilters()                // Remove all filters
+filters := handler.GetFilters()       // Get current filters
 ```
 
 ## Filter Behavior
 
-### Elevation (DEBUG when global is INFO)
+### Elevation (DEBUG when base is INFO)
 
 ```go
-// Global level: INFO
+// Base level: INFO
 // Filter: {type: "job_id", pattern: "debug_*", level: "debug"}
 
 logger.Debug("msg", "job_id", "debug_123") // Emitted (filter elevates)
 logger.Debug("msg", "job_id", "normal_456") // Suppressed (no filter match)
 ```
 
-### Suppression (WARN when global is INFO)
+### Suppression (WARN when base is INFO)
 
 ```go
-// Global level: INFO
+// Base level: INFO
 // Filter: {type: "job_id", pattern: "noisy_*", level: "warn"}
 
 logger.Info("msg", "job_id", "noisy_123")  // Suppressed (filter sets WARN)
 logger.Warn("msg", "job_id", "noisy_123")  // Emitted (WARN >= filter level)
-logger.Info("msg", "job_id", "normal_456") // Emitted (no filter, uses global)
+logger.Info("msg", "job_id", "normal_456") // Emitted (no filter, uses base)
 ```
 
 ### First Match Wins
@@ -462,7 +496,7 @@ filters := []logfilter.LogFilter{
 Use `output_level` to transform the emitted log level. This is useful when you want verbose debugging but don't want DEBUG-level noise in your log aggregator:
 
 ```go
-// Global level: INFO
+// Base level: INFO
 // Filter: {type: "job_id", pattern: "debug_*", level: "debug", output_level: "info"}
 
 logger.Debug("detailed trace", "job_id", "debug_123")
@@ -472,7 +506,7 @@ logger.Debug("detailed trace", "job_id", "debug_123")
 
 **Use cases:**
 - Elevate debug logs to INFO so they appear in production log streams
-- Make important debug info visible without lowering global log level
+- Make important debug info visible without lowering base log level
 - Tag certain debug logs as WARN for alerting systems
 
 ```json
@@ -484,27 +518,28 @@ logger.Debug("detailed trace", "job_id", "debug_123")
 
 ## Integration Example
 
-Load filters from JSON config (e.g., from S3):
+Load filters from JSON config (e.g., from S3), passing the handler explicitly:
 
 ```go
-func loadFilters(data []byte) error {
+func loadFilters(handler *logfilter.Handler, data []byte) error {
     var filters []logfilter.LogFilter
     if err := json.Unmarshal(data, &filters); err != nil {
         return err
     }
-    logfilter.SetFilters(filters)
+    handler.SetFilters(filters)
     return nil
 }
 
 // Periodic refresh
-func refreshFilters(ctx context.Context, s3Client *s3.Client) {
+func refreshFilters(ctx context.Context, handler *logfilter.Handler, s3Client *s3.Client) {
     ticker := time.NewTicker(5 * time.Minute)
+    defer ticker.Stop()
     for {
         select {
         case <-ticker.C:
             data, err := s3Client.GetObject(ctx, "config/logfilters.json")
             if err == nil {
-                loadFilters(data)
+                loadFilters(handler, data)
             }
         case <-ctx.Done():
             return
@@ -517,7 +552,7 @@ func refreshFilters(ctx context.Context, s3Client *s3.Client) {
 
 The handler is optimized for minimal overhead:
 
-- **Early level checks**: `Enabled` uses the global level and cached lowest filter level; `Handle` still checks suppression filters
+- **Early level checks**: `Enabled` uses the base level and cached lowest filter level; `Handle` still checks suppression filters
 - **Simple filter patterns**: Level filters use string prefix/suffix/contains matching
 - **Concurrent filter access**: Lock-free cached level reads, with an RWMutex protecting immutable filter snapshots
 - **Lazy source extraction**: Source file/function only extracted when source filters are configured

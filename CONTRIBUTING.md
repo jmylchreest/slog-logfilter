@@ -2,8 +2,9 @@
 
 The public module supports Go 1.22 and later and has no external runtime
 dependencies. Preserve source compatibility and documented behaviour, including
-logging output and global-state ownership. Add APIs for new behaviour instead of
-silently changing existing constructors. Sanitisation is opt-in.
+logging output and configuration ownership. Intentional API or behavioural breaks
+require explicit agreement, regression tests and migration notes, as in the v0.3.0
+ownership change. Do not silently change constructor semantics. Sanitisation is opt-in.
 
 ## Checks
 
@@ -36,8 +37,10 @@ history and tags first when working in a shallow clone. It uses the Go project's
 [`apidiff`](https://pkg.go.dev/golang.org/x/exp/cmd/apidiff) tool at a pinned revision,
 installed in a temporary directory. Its dependencies are development-only; the
 script does not change the library's `go.mod`. An incompatible report fails the
-check. This is a source-API check, not a proof of behavioural compatibility; retain
-regression tests for output, configuration ownership and sanitiser policies.
+check unless it exactly matches the reviewed, baseline-specific report in
+`scripts/api-breaks/`. The v0.2.1 report records the deliberate v0.3 removals;
+review any changes to this file as public API changes. This is a source-API check,
+not a proof of behavioural compatibility; retain regression tests for output, configuration ownership and sanitiser policies.
 
 ## Release process
 

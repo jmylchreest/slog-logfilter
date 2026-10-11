@@ -2,16 +2,15 @@
 
 ## v0.3.0
 
-This release adds opt-in sanitisation and isolated logger configuration while
-preserving the public API and default logging behaviour of v0.2.1.
+This release adds opt-in sanitisation and intentionally changes logger
+configuration ownership and removes the package-level configuration API.
+Applications must migrate as described below.
 
 ### Added
 
-- `NewIsolated` creates a logger with an independent level, filters and context
-  extractor registry, without changing package globals or `slog.Default`.
 - `Handler.SetLevel` and `Handler.GetLevel` expose instance-level control.
-- `WithContextExtractors` supplies an immutable, logger-local registry. It can
-  also be used with the existing `New` constructor.
+- `WithContextExtractors` supplies initial logger-local extractors. Handler-level
+  registration, lookup and removal methods support live registry updates.
 - `NewSanitiser`, `SanitiserRule`, `WithSanitiser`, `WithSanitisers` and
   `NewSanitisingHandler` support reusable, ordered sanitisation configurations.
 - Rules support field-name and value regexes, literal replacement text and
@@ -39,21 +38,34 @@ preserving the public API and default logging behaviour of v0.2.1.
 ### Fixed and optimised
 
 - Filter updates no longer race with logging or handler derivation.
+- Filter expiry values are copied on configuration input and output, preventing
+  indirect changes through caller-owned pointers.
 - Output-level transformation avoids copying record attributes.
 - Sanitisation reuses unchanged strings, groups and record attribute storage.
   Matching-heavy workloads allocate less but may do extra regex work; benchmarks
   are provided for measuring application-relevant tradeoffs.
 
-### Compatibility and migration
+### Breaking behaviour and migration from v0.2.x
 
 - Go 1.22 remains the minimum version. No external runtime dependencies added.
-- All v0.2.1 public APIs remain available. `New` still shares a global level, and
-  package-level filter setters still target the most recently created handler.
-  `SetDefault` still sets the default slog logger.
-- Derived loggers share levels but retain filter snapshots. Parent filter changes
-  do not update existing children. This is documented and tested, not changed.
-- To isolate a logger, replace `New` with `NewIsolated`, move global level/filter
-  setters to its `*Handler`, and supply context extractors with
-  `WithContextExtractors`. Package-level registrations do not affect isolated loggers.
-- Default sanitiser policy changes will be described in future release notes.
+- `New` creates an independent logger and does not change global state.
+- Removed package-level `SetLevel`, `GetLevel`, `SetFilters`, `GetFilters`,
+  `AddFilter`, `RemoveFilter`, `ClearFilters`, `RegisterContextExtractor`,
+  `UnregisterContextExtractor`, `GetContextExtractor`, `ClearContextExtractors`
+  and `ContextExtractorKeys`. Use the corresponding methods on
+  `logger.Handler().(*logfilter.Handler)`.
+- Removed `GetHandler`; retain the handler from the constructed logger instead.
+- Removed `SetDefault`; construct with `New(options...)`, then explicitly call
+  `slog.SetDefault(logger)`. There is no separate package-global registry.
+- API checks allow only these documented removals against v0.2.1; unexpected
+  source incompatibilities still fail.
+- `With` and `WithGroup` now share live filter and extractor updates, as well as
+  levels. Updates through a child also reach parents and siblings. Use separate
+  constructors when independent configuration is required.
+- `NewHandler` starts with an empty context registry and does not read the global
+  registry. Use its `RegisterContextExtractor` method instead. Supplying the same
+  `LevelVar` to separate handlers still shares only the level explicitly.
+- Sanitisers remain immutable and opt-in; log output without sanitisation is
+  unchanged when the same effective configuration is used.
+- Future default sanitiser policy changes will be described in release notes.
   Supply explicit rules when log-output stability requires a fixed policy.

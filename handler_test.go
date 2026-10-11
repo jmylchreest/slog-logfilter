@@ -37,7 +37,7 @@ func TestHandler_BasicFiltering(t *testing.T) {
 		t.Error("Expected debug message with matching filter to be emitted")
 	}
 
-	// Info should always be emitted (at or above global level)
+	// Info should always be emitted (at or above base level)
 	buf.Reset()
 	logger.Info("test message", "job_id", "normal_123")
 	if buf.Len() == 0 {
@@ -74,7 +74,7 @@ func TestHandler_FilterSuppression(t *testing.T) {
 		t.Error("Expected warn message with matching filter to be emitted")
 	}
 
-	// Info without matching job_id should be emitted (uses global INFO level)
+	// Info without matching job_id should be emitted (uses base INFO level)
 	buf.Reset()
 	logger.Info("normal message", "job_id", "normal_123")
 	if buf.Len() == 0 {
@@ -87,7 +87,14 @@ func TestHandler_ContextFilter(t *testing.T) {
 	type ctxKey string
 	const userIDKey ctxKey = "user_id"
 
-	RegisterContextExtractor("user_id", func(ctx context.Context) (string, bool) {
+	var buf bytes.Buffer
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelInfo)
+
+	inner := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	handler := NewHandler(inner, level)
+
+	handler.RegisterContextExtractor("user_id", func(ctx context.Context) (string, bool) {
 		if v := ctx.Value(userIDKey); v != nil {
 			if s, ok := v.(string); ok {
 				return s, true
@@ -95,14 +102,6 @@ func TestHandler_ContextFilter(t *testing.T) {
 		}
 		return "", false
 	})
-	defer ClearContextExtractors()
-
-	var buf bytes.Buffer
-	level := new(slog.LevelVar)
-	level.Set(slog.LevelInfo)
-
-	inner := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-	handler := NewHandler(inner, level)
 
 	handler.SetFilters([]LogFilter{
 		{Type: "context:user_id", Pattern: "debug_user_*", Level: "debug", Enabled: true},

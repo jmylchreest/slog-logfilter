@@ -17,7 +17,8 @@
 //	)
 //
 //	// Add filters at runtime
-//	logfilter.SetFilters([]logfilter.LogFilter{
+//	handler := logger.Handler().(*logfilter.Handler)
+//	handler.SetFilters([]logfilter.LogFilter{
 //	    {Type: "job_id", Pattern: "job_abc*", Level: "debug", Enabled: true},
 //	})
 //
@@ -28,7 +29,7 @@
 // Context filtering:
 //
 //	// Register a context extractor
-//	logfilter.RegisterContextExtractor("user_id", func(ctx context.Context) (string, bool) {
+//	handler.RegisterContextExtractor("user_id", func(ctx context.Context) (string, bool) {
 //	    if v := ctx.Value(UserIDKey); v != nil {
 //	        return v.(string), true
 //	    }
@@ -36,20 +37,21 @@
 //	})
 //
 //	// Use context: prefix in filter type
-//	logfilter.AddFilter(logfilter.LogFilter{
+//	handler.AddFilter(logfilter.LogFilter{
 //	    Type: "context:user_id", Pattern: "user_123", Level: "debug", Enabled: true,
 //	})
 //
 // # Independent instances
 //
-// Libraries and applications with multiple independent logging configurations
-// should use [NewIsolated]. It owns its level, filter configuration and context
-// extractor registry. [New] retains the package-global behaviour for compatibility;
-// [SetDefault] additionally installs the logger as slog.Default.
+// [New] creates an independent logger. Applications may explicitly install it
+// as the process default with slog.SetDefault. The package has no global registry.
 //
-// Derived handlers share levels, but capture filter snapshots. Configure filters
-// before calling With or WithGroup, or update the derived [Handler] directly.
-// See [WithContextExtractors] for instance-local context filtering.
+// Derived handlers share levels, filters and context extractors. Runtime updates
+// through any member apply to its entire logger family. Sanitisers remain
+// immutable and are inherited. See [WithContextExtractors] for initial registries.
+//
+// Version 0.3 removes package-level configuration functions. Use the methods on
+// logger.Handler().(*Handler) instead.
 //
 // # Sanitisation
 //
@@ -72,16 +74,6 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
-	"sync"
-)
-
-var (
-	// defaultHandler is the global handler instance
-	defaultHandler     *Handler
-	defaultHandlerLock sync.RWMutex
-
-	// defaultLevel is the global log level
-	defaultLevel = new(slog.LevelVar)
 )
 
 // Option configures the logger.
@@ -134,9 +126,9 @@ func WithFilters(filters []LogFilter) Option {
 }
 
 // WithContextExtractors sets a logger-local context extractor registry. The map
-// is copied; later map changes and package-level registrations have no effect.
+// is copied for each logger; later changes to the supplied map have no effect.
 // Nil selects an empty registry. Callbacks must be safe for concurrent use.
-// Without this option, New uses the global registry and NewIsolated uses none.
+// Every constructor starts with an empty registry unless this option is supplied.
 func WithContextExtractors(extractors map[string]ContextExtractor) Option {
 	snapshot := make(map[string]ContextExtractor, len(extractors))
 	for key, extractor := range extractors {
@@ -160,38 +152,20 @@ func WithSanitisers(sanitisers ...*Sanitiser) Option {
 	return func(o *options) { o.sanitisers = snapshot }
 }
 
-// New creates a logger using the package's shared level and registers its handler
-// for package-level filter setters. Calling New changes the level of all loggers
-// previously created by New; filter setters target only the most recent handler.
-// It does not call slog.SetDefault. Use [NewIsolated] for independent instances.
+// New creates an independent logger with its own level, filters and context
+// extractors. It does not change slog.Default; applications may call
+// slog.SetDefault explicitly. Use logger.Handler().(*Handler) for runtime updates,
+// which also reach derived loggers.
 func New(opts ...Option) *slog.Logger {
-	handler := newConfiguredHandler(defaultLevel, false, opts...)
-	defaultHandlerLock.Lock()
-	defaultHandler = handler
-	defaultHandlerLock.Unlock()
-	return slog.New(handler)
+	return slog.New(newConfiguredHandler(opts...))
 }
 
-// NewIsolated creates a logger with its own level, filters and context extractor
-// registry. It does not read or change the package's global configuration or
-// slog.Default. Options have the same defaults as New, except that context
-// extractors are empty unless supplied with [WithContextExtractors].
-//
-// Use logger.Handler().(*Handler) to change this instance's level and filters.
-// Derived loggers share the level but retain filter snapshots; see [Handler].
-func NewIsolated(opts ...Option) *slog.Logger {
-	return slog.New(newConfiguredHandler(new(slog.LevelVar), true, opts...))
-}
-
-func newConfiguredHandler(level *slog.LevelVar, isolated bool, opts ...Option) *Handler {
+func newConfiguredHandler(opts ...Option) *Handler {
 	o := &options{
 		level:  slog.LevelInfo,
 		format: "json",
 		output: os.Stdout,
 		source: true,
-	}
-	if isolated {
-		o.extractors = make(map[string]ContextExtractor)
 	}
 	o.workDir, _ = os.Getwd()
 
@@ -199,6 +173,7 @@ func newConfiguredHandler(level *slog.LevelVar, isolated bool, opts ...Option) *
 		opt(o)
 	}
 
+	level := new(slog.LevelVar)
 	level.Set(o.level)
 
 	trimPrefix := detectSourcePrefix()
@@ -225,7 +200,9 @@ func newConfiguredHandler(level *slog.LevelVar, isolated bool, opts ...Option) *
 
 	inner = NewSanitisingHandler(inner, o.sanitisers...)
 	handler := NewHandler(inner, level)
-	handler.extractors = o.extractors
+	for key, extractor := range o.extractors {
+		handler.RegisterContextExtractor(key, extractor)
+	}
 
 	// Apply initial filters if provided
 	if len(o.filters) > 0 {
@@ -233,89 +210,6 @@ func newConfiguredHandler(level *slog.LevelVar, isolated bool, opts ...Option) *
 	}
 
 	return handler
-}
-
-// SetLevel changes the global log level at runtime.
-func SetLevel(level slog.Level) {
-	defaultLevel.Set(level)
-}
-
-// GetLevel returns the current global log level.
-func GetLevel() slog.Level {
-	return defaultLevel.Level()
-}
-
-// SetFilters replaces all filters on the global handler.
-// Filters are applied in order; first match wins.
-func SetFilters(filters []LogFilter) {
-	defaultHandlerLock.RLock()
-	h := defaultHandler
-	defaultHandlerLock.RUnlock()
-
-	if h != nil {
-		h.SetFilters(filters)
-	}
-}
-
-// GetFilters returns a copy of the current filters.
-func GetFilters() []LogFilter {
-	defaultHandlerLock.RLock()
-	h := defaultHandler
-	defaultHandlerLock.RUnlock()
-
-	if h != nil {
-		return h.GetFilters()
-	}
-	return nil
-}
-
-// AddFilter adds a filter to the global handler.
-func AddFilter(filter LogFilter) {
-	defaultHandlerLock.RLock()
-	h := defaultHandler
-	defaultHandlerLock.RUnlock()
-
-	if h != nil {
-		h.AddFilter(filter)
-	}
-}
-
-// RemoveFilter removes filters matching the given type and pattern.
-func RemoveFilter(filterType, pattern string) {
-	defaultHandlerLock.RLock()
-	h := defaultHandler
-	defaultHandlerLock.RUnlock()
-
-	if h != nil {
-		h.RemoveFilter(filterType, pattern)
-	}
-}
-
-// ClearFilters removes all filters from the global handler.
-func ClearFilters() {
-	defaultHandlerLock.RLock()
-	h := defaultHandler
-	defaultHandlerLock.RUnlock()
-
-	if h != nil {
-		h.ClearFilters()
-	}
-}
-
-// GetHandler returns the global filter handler.
-// This can be used to wrap with additional handlers or for testing.
-func GetHandler() *Handler {
-	defaultHandlerLock.RLock()
-	defer defaultHandlerLock.RUnlock()
-	return defaultHandler
-}
-
-// SetDefault creates a new logger with the given options and sets it as
-// the default slog logger.
-func SetDefault(opts ...Option) *slog.Logger {
-	logger := New(opts...)
-	slog.SetDefault(logger)
-	return logger
 }
 
 // detectSourcePrefix discovers the filesystem prefix that should be stripped

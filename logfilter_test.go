@@ -15,8 +15,8 @@ func TestNew_DefaultOptions(t *testing.T) {
 	}
 
 	// Default level should be INFO
-	if GetLevel() != slog.LevelInfo {
-		t.Errorf("Expected default level INFO, got %v", GetLevel())
+	if logger.Handler().(*Handler).GetLevel() != slog.LevelInfo {
+		t.Errorf("Expected default level INFO, got %v", logger.Handler().(*Handler).GetLevel())
 	}
 }
 
@@ -33,8 +33,8 @@ func TestNew_WithOptions(t *testing.T) {
 		t.Fatal("Expected non-nil logger")
 	}
 
-	if GetLevel() != slog.LevelDebug {
-		t.Errorf("Expected level DEBUG, got %v", GetLevel())
+	if logger.Handler().(*Handler).GetLevel() != slog.LevelDebug {
+		t.Errorf("Expected level DEBUG, got %v", logger.Handler().(*Handler).GetLevel())
 	}
 
 	// Log something and verify output
@@ -50,7 +50,7 @@ func TestNew_WithFilters(t *testing.T) {
 		{Type: "job_id", Pattern: "test_*", Level: "debug", Enabled: true},
 	}
 
-	_ = New(
+	logger := New(
 		WithLevel(slog.LevelInfo),
 		WithFormat("text"),
 		WithOutput(&buf),
@@ -58,75 +58,68 @@ func TestNew_WithFilters(t *testing.T) {
 	)
 
 	// Verify filters were set
-	gotFilters := GetFilters()
+	gotFilters := logger.Handler().(*Handler).GetFilters()
 	if len(gotFilters) != 1 {
 		t.Errorf("Expected 1 filter, got %d", len(gotFilters))
 	}
 }
 
 func TestSetLevel(t *testing.T) {
-	_ = New(WithLevel(slog.LevelInfo))
+	h := New(WithLevel(slog.LevelInfo)).Handler().(*Handler)
 
-	SetLevel(slog.LevelDebug)
-	if GetLevel() != slog.LevelDebug {
-		t.Errorf("Expected DEBUG after SetLevel, got %v", GetLevel())
+	h.SetLevel(slog.LevelDebug)
+	if h.GetLevel() != slog.LevelDebug {
+		t.Errorf("Expected DEBUG after SetLevel, got %v", h.GetLevel())
 	}
 
-	SetLevel(slog.LevelWarn)
-	if GetLevel() != slog.LevelWarn {
-		t.Errorf("Expected WARN after SetLevel, got %v", GetLevel())
+	h.SetLevel(slog.LevelWarn)
+	if h.GetLevel() != slog.LevelWarn {
+		t.Errorf("Expected WARN after SetLevel, got %v", h.GetLevel())
 	}
 }
 
-func TestSetFilters_Global(t *testing.T) {
-	_ = New()
+func TestSetFilters_Handler(t *testing.T) {
+	h := New().Handler().(*Handler)
 
 	filters := []LogFilter{
 		{Type: "a", Pattern: "1", Level: "debug", Enabled: true},
 		{Type: "b", Pattern: "2", Level: "info", Enabled: true},
 	}
 
-	SetFilters(filters)
+	h.SetFilters(filters)
 
-	got := GetFilters()
+	got := h.GetFilters()
 	if len(got) != 2 {
 		t.Errorf("Expected 2 filters, got %d", len(got))
 	}
 
 	// Clear
-	ClearFilters()
-	if len(GetFilters()) != 0 {
+	h.ClearFilters()
+	if len(h.GetFilters()) != 0 {
 		t.Error("Expected 0 filters after clear")
 	}
 }
 
-func TestAddRemoveFilter_Global(t *testing.T) {
-	_ = New()
-	ClearFilters()
+func TestAddRemoveFilter_Handler(t *testing.T) {
+	h := New().Handler().(*Handler)
+	h.ClearFilters()
 
-	AddFilter(LogFilter{Type: "x", Pattern: "y", Level: "debug", Enabled: true})
-	if len(GetFilters()) != 1 {
+	h.AddFilter(LogFilter{Type: "x", Pattern: "y", Level: "debug", Enabled: true})
+	if len(h.GetFilters()) != 1 {
 		t.Error("Expected 1 filter after add")
 	}
 
-	RemoveFilter("x", "y")
-	if len(GetFilters()) != 0 {
+	h.RemoveFilter("x", "y")
+	if len(h.GetFilters()) != 0 {
 		t.Error("Expected 0 filters after remove")
 	}
 }
 
-func TestGetHandler(t *testing.T) {
-	_ = New()
-
-	handler := GetHandler()
-	if handler == nil {
-		t.Error("Expected non-nil handler")
-	}
-}
-
 func TestSetDefault(t *testing.T) {
+	previous := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(previous) })
 	var buf bytes.Buffer
-	logger := SetDefault(
+	logger := New(
 		WithLevel(slog.LevelInfo),
 		WithFormat("text"),
 		WithOutput(&buf),
@@ -135,6 +128,8 @@ func TestSetDefault(t *testing.T) {
 	if logger == nil {
 		t.Fatal("Expected non-nil logger")
 	}
+
+	slog.SetDefault(logger)
 
 	// slog.Default() should now use our logger
 	slog.Info("test via default")
@@ -199,7 +194,7 @@ func TestIntegration_FilterSuppression(t *testing.T) {
 		t.Error("Expected error with match to be emitted")
 	}
 
-	// Info without matching attribute - emitted (global level)
+	// Info without matching attribute - emitted (base level)
 	buf.Reset()
 	logger.Info("msg3", "job_id", "normal_456")
 	if buf.Len() == 0 {

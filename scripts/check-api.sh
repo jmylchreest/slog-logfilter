@@ -29,7 +29,12 @@ module=$(go list -m)
 
 # apidiff reports incompatibilities on stdout but exits successfully.
 if [[ -s "$scratch/report" ]]; then
-    cat "$scratch/report" >&2
-    exit 1
+    approved="scripts/api-breaks/$baseline.txt"
+    if [[ ! -f "$approved" ]] || ! diff -u "$approved" "$scratch/report"; then
+        cat "$scratch/report" >&2
+        exit 1
+    fi
+    echo "Only approved API breaks against $baseline; see CHANGELOG.md for migration."
+    exit 0
 fi
-echo "Public API is backward compatible with $baseline."
+echo "Exported Go API is source-compatible with $baseline; check behavioural migration notes separately."

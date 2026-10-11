@@ -1,0 +1,14 @@
+- AddFilter: removed
+- ClearContextExtractors: removed
+- ClearFilters: removed
+- ContextExtractorKeys: removed
+- GetContextExtractor: removed
+- GetFilters: removed
+- GetHandler: removed
+- GetLevel: removed
+- RegisterContextExtractor: removed
+- RemoveFilter: removed
+- SetDefault: removed
+- SetFilters: removed
+- SetLevel: removed
+- UnregisterContextExtractor: removed
